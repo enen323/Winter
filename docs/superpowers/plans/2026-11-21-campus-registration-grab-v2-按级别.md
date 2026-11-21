@@ -1,0 +1,867 @@
+# 校园活动报名平台 —— 名额抢报 实施计划（v2 按级别）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan phase-by-phase. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 实现「活动名额抢报」核心链路，按 L0→L1→L2→L3→L4 逐级推进，每级停下来让作者亲手跑一遍、提交、压测，产出可复现的阶梯证据，证明零超卖、零重复。
+
+**Architecture:** 单机一体化：一个 Spring Boot 应用 + MySQL + Redis + RocketMQ。Redis 是名额判定唯一权威点（Lua 原子脚本一次往返完成校验+扣减），MySQL 是最终真相与审计。报名链路形态由**一个**开关 `winter.registration.flow` 控制（`L0`/`L1`/`L2`），缓存与限流是彼此独立的特性开关（`winter.cache.enabled`、`winter.ratelimit.enabled`）——它们不改变报名逻辑，所以不并进 flow。失败补偿链：发消息失败降级同步落库，同步落库失败写本地 WAL 重放，对账任务最后兜底（只补写、不撤销）。
+
+**Tech Stack:** Java 21 / Spring Boot 3.3 / Maven / MySQL 8.4.13 / Redis 8.0.5 (Lettuce) / RocketMQ 5.5.1 (`org.apache.rocketmq:rocketmq-client`) / Flyway / JMeter 5.6.3 / Micrometer+Prometheus / Caffeine / Vue 3 + Vite
+
+**Spec:** `docs/superpowers/specs/2026-11-18-campus-registration-grab-design.md` —— 计划从设计文档推导，执行者必须同时读设计文档。
+**前版计划（按任务划分，含更细的接口推导过程）:** `docs/superpowers/plans/2026-11-21-campus-registration-grab-v1-按任务.md`
+
+## Global Constraints
+
+以下每条对每个阶段隐式生效，值从设计文档逐字复制：
+
+- **不使用 Docker**：机器装有飞连（corplink）安全客户端，会把 Docker 识别为风险软件。MySQL/Redis/RocketMQ 本机直装。`make up` 由 `bin/up.sh` 实现（健康检查 + 灌数据）。
+- **三层防超卖，任一层都无法单独造成超卖**：①Redis Lua 原子扣减 ②MySQL `UPDATE ... WHERE stock > 0` 影响行数兜底 ③`uk_activity_user(activity_id, user_id)` 唯一索引。
+- **Redis 是名额判定唯一权威点**，MySQL 不是判定点（L0 降级链路除外）。
+- **成功即事实（D1）**：Redis 扣减成功即返回「报名成功」，不可撤销；落库失败只能由对账补写并告警，**不得回滚库存或删除记录**。
+- **对账单向**：只补写、不撤销；「Redis 有而 DB 无」是最高优先级告警。
+- **不使用**占位状态、TTL 释放、超时释放、结果轮询接口。
+- **取消后重新报名复用同一行**（D5）：`status` 从 `CANCELED` 改回 `CONFIRMED`、更新 `updated_at`，不产生第二条记录。
+- **MySQL 隔离级别保持默认 REPEATABLE-READ，不调整**（D7）。若压测出现 `ERROR 1213 (40001): Deadlock found when trying to get lock`，修复只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`。
+- **压测有效性 5 前提**（违反任意一条整轮数据作废）：①并发请求必须用互不相同的 userId（CSV 数据集注入）②预签发 token ③成功判定以响应体结果码为准（配响应断言）④同步定时器模拟瞬间洪峰 ⑤评估压测机自身是否成为瓶颈。
+- **一条命令起全栈、一条命令压测、一条命令校验正确性**（DoD）。
+- 本阶段不做：SSO、支付、通知、签到核销、主办方审核、抽签摇号、微服务/K8s/分库分表。
+- **每一级必须单独跑一次完整压测 + verify**，不能只跑最终架构再反推中间数字（设计文档反目标：优化痕迹丢失）。
+
+## Review Focus
+
+设计文档是愿景文档。以下五类输入最可能坑到使用者，每条的测试挂在所属阶段里：
+
+| # | 输入/失败模式 | 合理的人会期待的行为 | 测试所属阶段 |
+|---|---|---|---|
+| 1 | Redis 扣减成功但落库失败（MQ 丢失/DB 不可用） | 用户已看到「报名成功」，DB 最终必须补上这条记录，且对账必须发现差异并告警；**不得**回滚库存 | L2.5 |
+| 2 | 同一 userId 并发重复提交（用户狂点、网络重试） | 只有一次生效，返回首次结果，库存只扣一次 | L0、L1 |
+| 3 | 未到开抢时间 / 活动已关闭 | 明确拒绝（`NOT_STARTED`/`CLOSED`），即使 Redis 里还有库存也不能放行 | L0、L1 |
+| 4 | MQ 重复投递 / 消费端重启重放同一条消息 | 不产生第二条报名记录（幂等） | L2 |
+| 5 | 取消后重新报名（复用同一行） | 唯一索引不误挡，`status` 回到 `CONFIRMED`，库存先回池再扣一次 | L1.5 |
+
+另两项必须做：`capacity <= 0` 或 `stock` 已为 0 时必须拒绝而非崩溃或出现负数（阶段 0 与 L0 覆盖）；压测机自身成为瓶颈时数据不可信，必须在每轮报告里记录压测机与应用机的资源分配（阶段 P 覆盖）。
+
+## 执行节奏（作者定的规矩）
+
+每个阶段结束时**停下来**，按这个顺序走：
+
+```
+实现 → 作者亲手跑一遍看有没有明显 bug → git commit → 压测（有压测价值的级别）→ 下一级
+```
+
+「作者亲手跑」不是形式：级别之间的 bug 越往后越难定位，L0 的一个下单顺序错误到 L2 会变成「偶发超卖」，查一周。
+
+**先写测试再写实现的阶段**（测试本身就是正确性证明，写反了会不自觉写出能过的测试）：L0、L1、L1.5、L2、L2.5、L4、JWT。
+**不搞先写测试的阶段**（手工验证更划算，TDD 在这里是仪式）：阶段 0 的骨架/Schema/CRUD、阶段 P、L3、阶段 X、阶段 V。
+
+---
+
+# 阶段 0：底座
+
+**Files:**
+- Create: `pom.xml`、`.gitignore`
+- Create: `src/main/java/com/winter/reg/WinterApplication.java`
+- Create: `src/main/resources/application.yml`
+- Create: `src/main/resources/db/migration/V1__init.sql`
+- Create: `src/main/java/com/winter/reg/domain/{Activity,Registration,RegistrationStatus,User}.java`
+- Create: `src/main/java/com/winter/reg/repo/{ActivityRepository,RegistrationRepository,UserRepository}.java`
+- Create: `src/main/java/com/winter/reg/auth/{JwtService,JwtAuthFilter}.java`
+- Create: `src/main/java/com/winter/reg/web/{AuthController,ActivityController,ResultCode,ApiResponse,GlobalExceptionHandler}.java`
+- Create: `src/main/java/com/winter/reg/web/dto/{ActivityRequest,ActivityResponse,RegisterResponse}.java`
+- Create: `src/main/java/com/winter/reg/service/ActivityService.java`
+- Create: `src/main/java/com/winter/reg/metrics/RegMetrics.java`
+- Create: `bin/up.sh`
+
+**Interfaces:**
+- Produces:
+  - `enum RegistrationStatus { CONFIRMED, CANCELED }`
+  - `enum ResultCode { SUCCESS(0), FULL(1001), ALREADY(1002), NOT_STARTED(1003), CLOSED(1004), NOT_FOUND(1005), RATE_LIMITED(1006), DEGRADED(1007) }`
+  - `record ApiResponse<T>(int code, String msg, T data)` —— 静态工厂 `ApiResponse.ok(data)` / `ApiResponse.fail(ResultCode)`
+  - `final class JwtService { JwtService(String secret, Duration ttl); String issue(Long userId, String username); JwtPayload verify(String token) throws JwtException; }`
+  - `record JwtPayload(Long userId, String username, long iat, long exp)`
+  - `ActivityService.create(ActivityRequest) -> ActivityResponse` / `get(Long) -> ActivityResponse`（不存在返回 `null`）/ `listOpen() -> List<ActivityResponse>`
+  - `POST /api/auth/register`、`POST /api/auth/login`、`POST /api/activities`、`GET /api/activities/{id}`、`GET /api/activities`
+  - HTTP 契约：**所有响应 HTTP 200**，业务成败只看 body 的 `code`（`0` = 报名成功）。这是压测前提 ③ 的直接结果——用 HTTP 码判成功会把业务失败算成成功。
+
+- [ ] **Step 1: 建库与 `.gitignore`**
+
+```sql
+CREATE DATABASE IF NOT EXISTS winter CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'winter'@'localhost' IDENTIFIED BY 'winter';
+GRANT ALL PRIVILEGES ON winter.* TO 'winter'@'localhost';
+```
+库名 `winter` 区别于本机已有的 `fjnu_wms`/`wms`。`.gitignore` 至少：`target/`、`node_modules/`、`dist/`、`jmeter.log`、`docs/benchmarks/html-report/`。**密码不写入任何会被提交的文件**。
+
+- [ ] **Step 2: `pom.xml` 与 Schema**
+
+依赖（不引入设计文档未提及的框架）：`spring-boot-starter-web`、`-data-jpa`、`-data-redis`、`-validation`、`-actuator`、`mysql:mysql-connector-java`、`flyway-core` + `flyway-mysql`、`org.apache.rocketmq:rocketmq-client:5.5.1`、`com.github.ben-manes.caffeine:caffeine`、`micrometer-registry-prometheus`、`spring-security-crypto`（只取 BCrypt，不上整套 Spring Security）；测试用 `spring-boot-starter-test`。Java release 21。
+
+`db/migration/V1__init.sql`：
+```sql
+CREATE TABLE activity (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  title       VARCHAR(200)  NOT NULL,
+  capacity    INT           NOT NULL,
+  stock       INT           NOT NULL,
+  start_time  DATETIME(3)   NOT NULL,
+  status      VARCHAR(20)   NOT NULL,
+  created_at  DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at  DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  CONSTRAINT chk_activity_capacity CHECK (capacity >= 0),
+  CONSTRAINT chk_activity_stock    CHECK (stock >= 0)
+);
+CREATE TABLE registration (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  activity_id BIGINT         NOT NULL,
+  user_id     BIGINT         NOT NULL,
+  status      VARCHAR(20)    NOT NULL,
+  created_at  DATETIME(3)    NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at  DATETIME(3)    NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  CONSTRAINT uk_activity_user UNIQUE (activity_id, user_id),
+  CONSTRAINT fk_reg_activity FOREIGN KEY (activity_id) REFERENCES activity(id),
+  INDEX idx_reg_activity_status (activity_id, status)
+);
+```
+`CHECK (stock >= 0)` 是三层防线之外的一层物理保险：任何让库存变负的 SQL 都会被数据库拒绝。
+
+- [ ] **Step 3: 先写 `JwtServiceTest`，再实现 `JwtService`**
+
+```java
+class JwtServiceTest {
+    JwtService svc = new JwtService("test-secret-32-bytes-minimum-length!", Duration.ofMinutes(30));
+    @Test void issueThenVerifyRoundTrips() { /* verify(t).userId()==1001L, username()=="alice" */ }
+    @Test void tamperedPayloadRejected() {
+        // 把 payload 换成 {"sub":"9999","exp":9999999999} 保留原签名 → 必须抛 JwtException
+    }
+    @Test void expiredTokenRejected() { /* ttl = Duration.ofSeconds(-1) → JwtException */ }
+    @Test void wrongSecretRejected() { /* 换密钥 verify 同一 token → JwtException */ }
+}
+```
+Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后 PASS。
+
+手写 HS256 不引 jjwt：`javax.crypto.Mac` + `Base64.getUrlEncoder().withoutPadding()`，header 固定 `{"alg":"HS256","typ":"JWT"}`，payload 含 `sub`/`name`/`iat`/`exp`。`verify` 必须用 `MessageDigest.isEqual` 常量时间比较，并拒绝签名不符、解析失败、缺 `exp`、已过期。**这是安全边界，四种拒绝情况都有测试钉住。**
+
+- [ ] **Step 4: 用户体系、活动 CRUD、最小指标**
+
+`AuthController`：注册用 BCrypt 哈希，登录返回 token。`JwtAuthFilter` 解析 `Authorization: Bearer <token>`，`/api/auth/**` 放行，其余 `/api/**` 拦截。`ActivityService.create` 校验 `capacity > 0`（否则 `IllegalArgumentException` → `GlobalExceptionHandler` 映射为 `code=1500`）——这是 Review Focus 里 `capacity<=0` 的第一道防线。`RegMetrics` 用 Micrometer `Counter` 命名 `registration_success_total` / `registration_full_total` / `registration_already_total` / `registration_not_started_total` / `registration_closed_total` / `registration_rate_limited_total` / `reconcile_missing_in_db_total` / `wal_replayed_total` / `mq_dead_lettered_total`，`application.yml` 暴露 `prometheus,health,metrics`。
+
+- [ ] **Step 5: `bin/up.sh`**
+
+一条命令起全栈：探测 MySQL 3306 / Redis 6379 / RocketMQ namesrv 9876 / broker 10911，未就绪则启动（RocketMQ 用 `JAVA_OPT_EXT="-Xms1g -Xmx1g"` 覆盖 namesrv、`"-Xms2g -Xmx2g"` 覆盖 broker——**脚本默认 `-Xms8g -Xmx8g`+`MaxDirectMemorySize=15g` 本机扛不住**）；全就绪后启动 Spring Boot；打印 `READY http://localhost:8080/actuator/health`。**不硬编码 broker 名**（重启后可能从 `broker-a` 变 `HP`），用 namesrv 地址寻址。
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+```bash
+bash bin/up.sh
+curl -s localhost:8080/actuator/health                      # 期望 {"status":"UP"}
+curl -s -XPOST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'
+curl -s -XPOST localhost:8080/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'   # 拿到 token
+TOKEN=...; AID=...
+curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"title":"抢名额测试","capacity":100,"startTime":"2026-11-21T12:00:00"}'
+curl -s localhost:8080/api/activities/$AID
+curl -s localhost:8080/api/activities
+```
+确认：无 token 的 `/api/**` 被拒、注册/登录/建活动/查活动四步全通、`curl -s localhost:8080/actuator/prometheus | grep registration` 有指标。**发现 bug 就地修，别带到下一级。**
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add -A && git commit -m "feat: 底座（Schema、JWT、活动 CRUD、最小指标、一键起全栈）"
+```
+
+---
+
+# 阶段 L0：直连 MySQL 条件更新
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/service/RegistrationService.java`
+- Create: `src/main/java/com/winter/reg/service/DbRegistrationService.java`
+- Create: `src/main/java/com/winter/reg/service/StockExhaustedException.java`
+- Create: `src/main/java/com/winter/reg/web/RegistrationController.java`
+- Create: `src/main/resources/application-l0.yml`
+- Modify: `src/main/java/com/winter/reg/repo/{ActivityRepository,RegistrationRepository}.java`
+- Test: `src/test/java/com/winter/reg/service/DbRegistrationServiceTest.java`
+
+**Interfaces:**
+- Consumes: 阶段 0 的全部
+- Produces:
+  - `interface RegistrationService { RegResult register(Long activityId, Long userId); }`
+  - `enum RegResult { SUCCESS, FULL, ALREADY, NOT_STARTED, CLOSED, NOT_FOUND, RATE_LIMITED, DEGRADED }`
+  - `RegistrationRepository.tryConfirm(Long activityId, Long userId) -> int` —— `INSERT ... ON DUPLICATE KEY UPDATE id=id`，返回 0 表示已存在
+  - `ActivityRepository.decrementStockIfPositive(Long id) -> int` —— `UPDATE activity SET stock=stock-1 WHERE id=? AND stock>0`
+  - `RegistrationRepository.findByActivityIdAndUserId(Long, Long) -> Optional<Registration>`
+  - `POST /api/registrations/{activityId}`（需登录，userId 取自 token，**不接收 body 里的 userId**）
+  - `application-l0.yml`：`winter.registration.flow=L0`
+
+- [ ] **Step 1: 先写失败的测试 `DbRegistrationServiceTest`**
+
+```java
+@SpringBootTest @ActiveProfiles("l0")
+class DbRegistrationServiceTest {
+    @Autowired RegistrationService service;
+    @Autowired ActivityRepository activityRepository;
+    @Autowired RegistrationRepository registrationRepository;
+    Long aid;
+
+    @BeforeEach void seed() {
+        Activity a = new Activity(); a.setTitle("L0测试"); a.setCapacity(100); a.setStock(100);
+        a.setStartTime(LocalDateTime.now().minusMinutes(1)); a.setStatus("OPEN");
+        aid = activityRepository.saveAndFlush(a).getId();
+    }
+
+    @Test void singleRegisterSucceeds_thenSameUserAlready() {
+        assertThat(service.register(aid, 1001L)).isEqualTo(RegResult.SUCCESS);
+        assertThat(service.register(aid, 1001L)).isEqualTo(RegResult.ALREADY);
+        assertThat(activityRepository.findById(aid).get().getStock()).isEqualTo(99);
+    }
+    @Test void notStartedAndClosedRejected() { /* 未来 startTime → NOT_STARTED；status=CLOSED → CLOSED */ }
+    @Test void unknownActivityReturnsNotFound() { assertThat(service.register(999999L, 8001L)).isEqualTo(RegResult.NOT_FOUND); }
+    @Test void concurrentRegister_noOversell_noDuplicate() throws Exception {
+        int threads = 400;                    // 远超 capacity=100
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<RegResult>> fs = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final long uid = 20_000L + i;     // 互不相同的 userId
+            fs.add(pool.submit(() -> { start.await(); return service.register(aid, uid); }));
+        }
+        start.countDown();                    // 同刻释放
+        long success = fs.stream().map(f -> { try { return f.get(); } catch (Exception e) { throw new RuntimeException(e); } })
+                         .filter(r -> r == RegResult.SUCCESS).count();
+        pool.shutdown();
+        assertThat(success).isEqualTo(100);                                    // 恰好 100，不是 <=100
+        assertThat(activityRepository.findById(aid).get().getStock()).isEqualTo(0);
+        assertThat(registrationRepository.count()).isEqualTo(100);             // 无重复行
+    }
+}
+```
+Run: `mvn test -Dtest=DbRegistrationServiceTest` → 先 FAIL，实现后 PASS。
+
+**断言写 `== 100` 而不是 `<= 100` 是这个测试的全部价值**：`<=` 会把「名额被吞」也算成通过。
+
+- [ ] **Step 2: 实现 `DbRegistrationService`**
+
+方法标注 `@Transactional`。顺序是**先插记录、后扣库存**：
+1. `tryConfirm` 靠唯一索引挡住重复（返回 0 → `ALREADY`，此时还没扣库存）
+2. `decrementStockIfPositive` 返回 0 说明库存空了 → 抛 `StockExhaustedException` 让事务回滚，已插入的那行随之消失
+
+反过来（先扣后插）在唯一索引命中时会少扣库存——不卖超但会「吞名额」，是本项目最阴的一类 bug。`GlobalExceptionHandler` 把 `StockExhaustedException` 映射为 `ApiResponse.fail(ResultCode.FULL)`。
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+用 curl 打报名接口，逐个确认五种返回的中文提示：`报名成功` / `已满`（把 capacity 建成 1，连打两次）/ `已报名`（同 token 再打）/ `未开始`（建一个未来时间的活动）/ `活动不存在`。**重点看「已满」**——这是 L0 唯一能证明「条件更新兜底」生效的路径。
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add -A && git commit -m "feat: L0 报名链路（MySQL 条件更新，含并发零超卖测试）"
+```
+
+---
+
+# 阶段 P：压测脚手架
+
+放在 L0 之后、第一次压测之前——**手工 JMeter 一课要有一个真实接口可打**，且这时接口最简单，最看得懂。
+
+**Files:**
+- Create: `jmeter/grab.jmx`、`jmeter/grab-broken-same-user.jmx`、`jmeter/grab-broken-no-assertion.jmx`
+- Create: `jmeter/users.csv`（模板）、`jmeter/tokens.csv`
+- Create: `bin/seed-users.sh`、`bin/bench.sh`、`bin/verify.sh`
+- Create: `docs/benchmarks/README.md`
+
+**Interfaces:**
+- Consumes: L0 的全部接口
+- Produces:
+  - `bin/bench.sh <level> <threads> <durationSeconds> <capacity>` —— 一条命令跑完压测+屏障+校验+汇总
+  - `bin/verify.sh <activityId>` —— 退出码非 0 即校验失败
+  - `jmeter/users.csv` 每行 `userId,username`；`jmeter/tokens.csv` 每行 `userId,token`
+
+- [ ] **Step 1: `bin/seed-users.sh`**
+
+批量注册 10 万个账号并为每个账号登录拿 token，输出两个 CSV。这是压测有效性前提 ②——**压测中不走登录**，否则瓶颈在登录接口而不是报名链路。账号池用完后归档，不每次重新生成。
+
+- [ ] **Step 2: `jmeter/grab.jmx` —— 五条前提逐条落在配置里**
+
+1. **CSV Data Set Config** 读 `jmeter/tokens.csv`，变量 `userId`/`token`，每线程取不同行 → 前提 ①
+2. **HTTP Header Manager** 带 `Authorization: Bearer ${token}` → 前提 ②
+3. **HTTP Request** `POST /api/registrations/{activityId}`，body 空 → 接口不接收 body 里的 userId
+4. **Synchronizing Timer**（`Number of Simultaneous Users to Group by = ${__P(threads,3000)}`）放在请求前 → 前提 ④
+5. **Response Assertion** 对响应体匹配 `"code":0`，配 **JSON Extractor** 把 `code` 提成变量 → 前提 ③
+6. **监听器**：Summary Report + Aggregate Graph + `Simple Data Writer` 写 `.jtl`
+
+- [ ] **Step 3: 两个「坏」jmx（必须入库）**
+
+`grab-broken-same-user.jmx`：CSV 改成常量 userId。`grab-broken-no-assertion.jmx`：去掉响应断言，按 HTTP 200 判成功。这两个文件证明「什么样的压测数据是假的」。
+
+- [ ] **Step 4: 作者亲手跑一次（不可委派）**
+
+1. GUI 模式打开 `jmeter/grab.jmx`，线程数 50、时长 30 秒，**手动跑一次**，逐个点开 Summary Report / Aggregate Graph / View Results Tree 看每项含义
+2. 打开生成的 `.jtl`，逐列看懂 `timeStamp`/`elapsed`/`label`/`responseCode`/`responseMessage`/`success`/`bytes`/`sentBytes`/`grpThreads`/`allThreads`/`Latency`/`IdleTime`/`Connect`
+3. 跑 `grab-broken-same-user.jmx` 对比：成功数应接近 1、绝大多数返回 `"code":1002`——这就是「测的是去重而非抢名额」
+4. 跑 `grab-broken-no-assertion.jmx` 对比：HTTP 200 但 body 是 `"code":1001` 的样本被算成成功
+
+**第 3、4 步看到的数据变化，比任何一次漂亮的压测报告都更能说明这些数字为什么可信。** 结论写进 `docs/benchmarks/README.md`。
+
+- [ ] **Step 5: `bin/verify.sh`**
+
+```bash
+# 1. 成功报名数 == 名额上限
+CONFIRMED=$(mysql -N -e "SELECT COUNT(*) FROM registration WHERE activity_id=$AID AND status='CONFIRMED'")
+[ "$CONFIRMED" -eq "$CAPACITY" ] || fail "CONFIRMED=$CONFIRMED != capacity=$CAPACITY"
+# 2. 无重复 (activity_id, user_id)
+DUP=$(mysql -N -e "SELECT COUNT(*) FROM (SELECT activity_id,user_id FROM registration WHERE activity_id=$AID GROUP BY activity_id,user_id HAVING COUNT(*)>1) t")
+[ "$DUP" -eq 0 ] || fail "发现 $DUP 组重复报名"
+# 3. Redis 库存 == 0
+[ "$(redis-cli GET stock:$AID)" = "0" ] || fail "Redis 库存未清零"
+# 4. DB 库存 == 0
+DBSTOCK=$(mysql -N -e "SELECT stock FROM activity WHERE id=$AID")
+[ "$DBSTOCK" -eq 0 ] || fail "DB 库存未清零"
+# 5. deadlock 计数（D7）
+```
+任一条不满足打印 `VERIFY FAILED: <原因>` 并 `exit 1`；全过打印 `VERIFY PASSED`。
+
+- [ ] **Step 6: 证明 verify.sh 会失败**
+
+人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh`。
+Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被证明会失败**，否则它的通过没有意义。
+
+- [ ] **Step 7: `bin/bench.sh`**
+
+```bash
+bin/bench.sh <level> <threads> <durationSeconds> <capacity>
+```
+流程：重置环境（删旧活动与 Redis 键）→ 以对应 profile 起应用 → 灌入目标活动（capacity 与入参一致，`startTime` 设为过去）→ JMeter 非 GUI + `-e -o` 出 HTML 报告 → **发屏障消息并等消费者追平**（D5：不用「等 N 秒」猜）→ 调 `bin/verify.sh` → 把 QPS/P99/错误率/超卖数写进 `docs/benchmarks/YYYY-MM-DD-L<level>-<说明>.md`。报告必须记录**压测机与应用机的资源分配**（前提 ⑤）。
+
+- [ ] **⛔ 停下来 + 第一次压测**
+
+```bash
+bin/bench.sh l0 3000 60 500
+```
+Expected: `VERIFY PASSED`，`docs/benchmarks/2026-11-21-L0-基线.md` 生成。**这是整个项目的第一个数字，也是后面每一级要对比的基准。**
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add -A && git commit -m "feat: 压测脚手架（jmx + 预生成账号池 + bench/verify）"
+```
+
+---
+
+# 阶段 L1：Redis Lua 预扣 + 同步落库
+
+**Files:**
+- Create: `src/main/resources/lua/{grab,cancel}.lua`
+- Create: `src/main/java/com/winter/reg/config/RedisConfig.java`
+- Create: `src/main/java/com/winter/reg/lua/{RegistrationScripts,RedisKeys}.java`
+- Create: `src/main/java/com/winter/reg/service/LuaRegistrationService.java`
+- Create: `src/main/resources/application-l1.yml`
+- Modify: `src/main/java/com/winter/reg/service/ActivityService.java`
+- Test: `src/test/java/com/winter/reg/lua/GrabScriptTest.java`
+- Test: `src/test/java/com/winter/reg/service/LuaRegistrationServiceTest.java`
+
+**Interfaces:**
+- Consumes: L0 的 `RegistrationService` 接口不变
+- Produces:
+  - `record RedisKeys { static String stock(Long aid); static String enrolled(Long aid); static String result(Long aid, Long uid); static String activitySnapshot(Long aid); }` —— 键名逐字照设计文档 7.2/7.4：`stock:{aid}`、`enrolled:{aid}`、`result:{aid}:{uid}`，另加 `activity:{aid}`（HASH，字段 `start_ms`、`open`）
+  - `enum GrabCode { SUCCESS(1), FULL(2), ALREADY(3), NOT_STARTED(4), CLOSED(5) }`
+  - `enum CancelCode { SUCCESS(1), NOT_FOUND(2) }`
+  - `RegistrationScripts.grab(Long activityId, Long userId, int resultTtlSeconds) -> GrabCode`
+  - `RegistrationScripts.cancel(Long activityId, Long userId) -> CancelCode`
+  - `ActivityService.create` 现在同时写 Redis：`SET stock:{aid} = capacity`、`HSET activity:{aid} start_ms <epochMillis> open 1`
+  - `application-l1.yml`：`winter.registration.flow=L1`
+
+- [ ] **Step 1: 先写失败的 `GrabScriptTest`（并发用例是本阶段的存在理由）**
+
+```java
+@SpringBootTest
+class GrabScriptTest {
+    @Autowired RegistrationScripts scripts;
+    @Autowired StringRedisTemplate redis;
+    Long aid = 4242L; int capacity = 100; int threads = 500;   // 远超名额
+
+    @BeforeEach void seed() {
+        redis.opsForValue().set(RedisKeys.stock(aid), String.valueOf(capacity));
+        redis.opsForHash().putAll(RedisKeys.activitySnapshot(aid),
+            Map.of("start_ms", String.valueOf(System.currentTimeMillis() - 60_000), "open", "1"));
+    }
+    @AfterEach void clean() { /* 删 stock/enrolled/activitySnapshot 三个键 */ }
+
+    @Test void firstSucceeds_secondSameUserAlready() {
+        assertThat(scripts.grab(aid, 1001L, 60)).isEqualTo(GrabCode.SUCCESS);
+        assertThat(scripts.grab(aid, 1001L, 60)).isEqualTo(GrabCode.ALREADY);
+        assertThat(redis.opsForValue().get(RedisKeys.stock(aid))).isEqualTo("99");
+    }
+    @Test void notStartedRejected() { /* start_ms 设为未来 → NOT_STARTED */ }
+    @Test void closedRejected() { /* open=0 → CLOSED */ }
+    @Test void missingStockKeyTreatedAsFull_notNegativeStock() {
+        redis.delete(RedisKeys.stock(aid));
+        assertThat(scripts.grab(aid, 4004L, 60)).isEqualTo(GrabCode.FULL);
+    }
+    @Test void concurrentGrab_successCountEqualsCapacity_noOversell() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<GrabCode>> fs = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final long uid = 10_000L + i;
+            fs.add(pool.submit(() -> { start.await(); return scripts.grab(aid, uid, 60); }));
+        }
+        start.countDown();
+        long success = fs.stream().map(f -> { try { return f.get(); } catch (Exception e) { throw new RuntimeException(e); } })
+                         .filter(c -> c == GrabCode.SUCCESS).count();
+        pool.shutdown();
+        assertThat(success).isEqualTo(capacity);                                  // 恰好 100
+        assertThat(redis.opsForSet().size(RedisKeys.enrolled(aid))).isEqualTo(capacity);
+        assertThat(redis.opsForValue().get(RedisKeys.stock(aid))).isEqualTo("0");
+    }
+}
+```
+Run: `mvn test -Dtest=GrabScriptTest` → 先 FAIL，实现后 PASS。
+
+- [ ] **Step 2: 写 `lua/grab.lua`**
+
+```lua
+-- KEYS[1]=stock:{aid} KEYS[2]=enrolled:{aid} KEYS[3]=result:{aid}:{uid} KEYS[4]=activity:{aid}
+-- ARGV[1]=userId ARGV[2]=resultTtlSeconds ARGV[3]=nowMillis
+-- 返回 1=SUCCESS 2=FULL 3=ALREADY 4=NOT_STARTED 5=CLOSED
+if tonumber(redis.call('HGET', KEYS[4], 'open') or '0') ~= 1 then return 5 end
+local startMs = tonumber(redis.call('HGET', KEYS[4], 'start_ms') or '0')
+if startMs > 0 and tonumber(ARGV[3]) < startMs then return 4 end
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return 3 end
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock == nil or stock <= 0 then return 2 end
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[3], '1', 'EX', ARGV[2])
+return 1
+```
+`stock` 键缺失视为 `FULL` 而不是无限库存——缺失说明活动没初始化，放行即超卖。
+
+**这是计划相对设计文档 7.1 的唯一细化**：时间/状态校验并入 Lua（读 `activity:{aid}` 快照），一次 Redis 往返完成，同时消除「校验通过」到「扣减」之间的 TOCTOU 窗口。不改变任何设计决定。
+
+- [ ] **Step 3: 实现 `RegistrationScripts`、`RedisConfig`、`LuaRegistrationService`**
+
+`RegistrationScripts` 用 `@Value("classpath:lua/grab.lua")` 注入脚本文本，构造 `DefaultRedisScript<Long>`，`redisTemplate.execute(script, keys, args)` 调用。`RedisConfig` 配 Lettuce（`127.0.0.1:6379`）与 `StringRedisTemplate`。
+
+`LuaRegistrationService.register`：`scripts.grab(...)` 的 `FULL`/`ALREADY`/`NOT_STARTED`/`CLOSED` 直接映射为对应 `RegResult`；`SUCCESS` 则按 `flow` 落库（L1 只有同步一支）。**同步落库失败不得撤销 Redis**（D1）：记 `reconcile_missing_in_db_total` 计数器 + ERROR 日志，交给 L2.5 的对账补写。`RedisException` 时降级到 `DbRegistrationService`（D2 的长期降级链路，由代码 catch 实现，不是配置开关）。
+
+`flow` 用一个枚举而非 `deduct`+`persist` 两个布尔/枚举：`flow=L0`→`DbRegistrationService`；`flow=L1`→`LuaRegistrationService`（同步）；`flow=L2`→`LuaRegistrationService`（MQ）。两个独立旋钮能组合出 `deduct=DB, persist=MQ` 这种无意义状态。
+
+- [ ] **Step 4: 先写失败的 `LuaRegistrationServiceTest`，再补齐**
+
+在 L0 用例基础上改两处断言，并发用例结构照抄 L0：
+```java
+@Test void successMeansRowAlreadyInDb_syncPersist() {
+    assertThat(service.register(aid, 1001L)).isEqualTo(RegResult.SUCCESS);
+    assertThat(registrationRepository.count()).isEqualTo(1);   // 同步落库：不等 MQ
+}
+@Test void notStartedRejected_evenThoughRedisHasStock() {
+    assertThat(service.register(futureId, 3003L)).isEqualTo(RegResult.NOT_STARTED);
+    assertThat(redis.opsForValue().get(RedisKeys.stock(futureId))).isEqualTo("5");  // 库存没被碰
+}
+```
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+`--spring.profiles.active=l1` 启动，用 curl 打一遍 L0 时的五种返回，再打一次「同一个 token 打两次」。**重点对比 L0 与 L1 的 P99 感受**——L1 的用户路径应该明显不含 DB 写。
+
+- [ ] **Step 5: 提交 + 压测**
+
+```bash
+git add -A && git commit -m "feat: L1 Redis Lua 预扣 + 同步落库"
+bin/bench.sh l1 3000 60 500
+```
+Expected: `VERIFY PASSED`，报告里 QPS/P99 相对 L0 有可解释的变化。
+
+---
+
+# 阶段 L1.5：取消报名与名额回池
+
+单独一个阶段而不是并进 L1：它有自己独立的 bug 面（唯一索引从「挡重复」变成「保证只有一行」），且是业务闭环的一半。
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/service/CancelService.java`
+- Create: `src/main/java/com/winter/reg/web/CancelController.java`
+- Create: `src/main/resources/lua/cancel.lua`
+- Modify: `src/main/java/com/winter/reg/repo/RegistrationRepository.java`
+- Test: `src/test/java/com/winter/reg/service/CancelServiceTest.java`
+
+**Interfaces:**
+- Produces:
+  - `interface CancelService { RegResult cancel(Long activityId, Long userId); }` —— 返回 `SUCCESS` / `NOT_FOUND`（未报名或已取消）/ `RATE_LIMITED`
+  - `DELETE /api/registrations/{activityId}`（需登录）
+  - `RegistrationRepository.reuseRow(Long activityId, Long userId) -> int` —— `UPDATE registration SET status='CONFIRMED', updated_at=CURRENT_TIMESTAMP(3) WHERE activity_id=? AND user_id=? AND status='CANCELED'`
+
+- [ ] **Step 1: 先写失败的 `CancelServiceTest`**
+
+```java
+@SpringBootTest @ActiveProfiles("l1")
+class CancelServiceTest {
+    @Test void registerCancelReRegister_reusesSameRow() throws Exception {
+        assertThat(registerService.register(aid, 1001L)).isEqualTo(RegResult.SUCCESS);
+        assertThat(registrationRepository.count()).isEqualTo(1);
+
+        assertThat(cancelService.cancel(aid, 1001L)).isEqualTo(RegResult.SUCCESS);
+        assertThat(registrationRepository.findByActivityIdAndUserId(aid, 1001L).get().getStatus())
+            .isEqualTo(RegistrationStatus.CANCELED);
+        assertThat(activityRepository.findById(aid).get().getStock()).isEqualTo(5);    // 名额回池
+
+        assertThat(cancelService.cancel(aid, 1001L)).isEqualTo(RegResult.NOT_FOUND);  // 已取消再取消
+
+        assertThat(registerService.register(aid, 1001L)).isEqualTo(RegResult.SUCCESS);
+        assertThat(registrationRepository.count()).isEqualTo(1);                       // 仍是同一行
+        assertThat(registrationRepository.findByActivityIdAndUserId(aid, 1001L).get().getStatus())
+            .isEqualTo(RegistrationStatus.CONFIRMED);                                  // D5
+        assertThat(activityRepository.findById(aid).get().getStock()).isEqualTo(4);    // 又扣一次
+    }
+    @Test void cancelWithoutRegisterReturnsNotFound() {
+        assertThat(cancelService.cancel(aid, 9999L)).isEqualTo(RegResult.NOT_FOUND);
+    }
+}
+```
+
+- [ ] **Step 2: 实现 `cancel.lua`、`CancelService`、`reuseRow`**
+
+```lua
+-- KEYS[1]=stock:{aid} KEYS[2]=enrolled:{aid} KEYS[3]=result:{aid}:{uid}
+-- ARGV[1]=userId
+-- 返回 1=SUCCESS 2=NOT_FOUND
+if redis.call('SREM', KEYS[2], ARGV[1]) == 0 then return 2 end
+redis.call('INCR', KEYS[1])
+redis.call('DEL', KEYS[3])
+return 1
+```
+`CancelService.cancel` 调 `cancel.lua`，`SUCCESS` 则同步把 DB 记录置 `CANCELED` + `stock+1`（L1 阶段没有 MQ，直接同步）。`LuaRegistrationService` 的落库分支**不能直接用 `INSERT`**：先试 `reuseRow`（更新已存在的 CANCELED 行），返回 0 再 `tryConfirm`。
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+跑完整闭环：报名 → 我的报名 → 取消 → 再报名。**重点确认取消后名额真的回池了**（剩余名额 +1），以及再报名不会报「已报名」。
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add -A && git commit -m "feat: 取消报名与名额回池（复用同一行）"
+```
+
+---
+
+# 阶段 L2：MQ 异步落库
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/mq/{RegistrationEventPublisher,RegistrationEventConsumer,BarrierProducer,MqConfig}.java`
+- Create: `src/main/resources/application-l2.yml`
+- Modify: `src/main/java/com/winter/reg/service/LuaRegistrationService.java`
+- Modify: `src/main/java/com/winter/reg/mq/RegistrationEventConsumer.java`（`CANCEL` 分支）
+- Test: `src/test/java/com/winter/reg/mq/RegistrationEventConsumerTest.java`
+
+**Interfaces:**
+- Produces:
+  - `enum EventType { CREATE, CANCEL }`
+  - `record RegistrationEvent(Long activityId, Long userId, EventType type, String eventId)`
+  - `RegistrationEventPublisher.publish(RegistrationEvent) -> boolean`（false = 发送失败）
+  - `RegistrationEventConsumer.onMessage(RegistrationEvent)` —— 幂等消费
+  - `BarrierProducer.sendBarrier(String topic)`
+  - `application-l2.yml`：`winter.registration.flow=L2`，`winter.mq.namesrv=127.0.0.1:9876`，topic `REGISTRATION`
+
+- [ ] **Step 1: 先写失败的 `RegistrationEventConsumerTest`**
+
+```java
+@SpringBootTest @ActiveProfiles("l2")
+class RegistrationEventConsumerTest {
+    @Test void publishedEventEventuallyInDb() throws Exception {
+        assertThat(publisher.publish(new RegistrationEvent(aid, 1001L, EventType.CREATE, UUID.randomUUID().toString()))).isTrue();
+        await().atMost(10, SECONDS).until(() -> registrationRepository.count() == 1);
+    }
+    @Test void duplicateEventProducesExactlyOneRow() throws Exception {
+        String eid = UUID.randomUUID().toString();
+        RegistrationEvent e = new RegistrationEvent(aid, 1001L, EventType.CREATE, eid);
+        publisher.publish(e); publisher.publish(e); publisher.publish(e);   // 同一条投三次
+        await().atMost(10, SECONDS).until(() -> registrationRepository.count() == 1);  // 仍只有一行
+        assertThat(activityRepository.findById(aid).get().getStock()).isEqualTo(99);   // 只扣一次
+    }
+}
+```
+
+- [ ] **Step 2: 实现生产者与消费者**
+
+生产者用 `org.apache.rocketmq:rocketmq-client:5.5.1`（**本机已在 Java 21 实测可用的同一版本**，不用 `rocketmq-spring-boot-starter`，避免版本不匹配）。同步发送、超时 3 秒，带 `eventId`。**不硬编码 broker 名**，用 namesrv 寻址。
+
+消费者按活动批量拉取（`consumeMessageBatchMaxSize` 可配）：`CREATE` 走 `tryConfirm`（返回 0 说明已存在，幂等跳过）；`CANCEL` 走「status 置 `CANCELED` + `stock+1`」。**重复投递不产生第二条记录**靠唯一索引 + `tryConfirm` 的 0 返回值——这是 Review Focus 第 4 条的答案。消费失败返回 `RECONSUME_LATER`，重试达上限进死信队列并打 ERROR 日志 + `mq_dead_lettered_total`。
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+`--spring.profiles.active=l2` 启动，打报名，**立刻**查 DB（应该还没有行），等一两秒再查（行出现）。然后取消一次，确认 `status=CANCELED` 且 `stock` 回池。**这一步是理解「用户路径不含 DB 写」的唯一方式**，别跳过。
+
+- [ ] **Step 3: 提交 + 压测**
+
+```bash
+git add -A && git commit -m "feat: L2 RocketMQ 异步落库（幂等消费）"
+bin/bench.sh l2 3000 60 500
+```
+Expected: `VERIFY PASSED`（屏障消息保证消费者已追平，不是猜的），报告含 MQ 堆积与消费延迟。
+
+---
+
+# 阶段 L2.5：失败补偿链与对账（D1 + D6）
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/wal/{WalWriter,WalReplayer}.java`
+- Create: `src/main/java/com/winter/reg/service/ReconciliationService.java`
+- Test: `src/test/java/com/winter/reg/service/ReconciliationServiceTest.java`
+- Test: `src/test/java/com/winter/reg/wal/WalWriterTest.java`
+
+**Interfaces:**
+- Produces:
+  - `WalWriter.append(RegistrationEvent) -> void` —— 追加 JSON 行到 `logs/wal/registration-<date>.log`
+  - `WalReplayer.replay() -> int` —— 重放未确认事件，返回成功补写的条数
+  - `ReconciliationService.reconcile(Long activityId) -> ReconciliationReport`
+  - `record ReconciliationReport(int inRedisNotInDb, int inDbNotInRedis, long redisStock, long dbConfirmed)` —— **只报告，不修复 Redis 侧**
+
+- [ ] **Step 1: 先写失败的 `ReconciliationServiceTest`**
+
+```java
+@SpringBootTest @ActiveProfiles("l2")
+class ReconciliationServiceTest {
+    @Test void redisHasRecordButDbMissing_isReportedAndBackfilled() throws Exception {
+        aid = activityService.create(new ActivityRequest("对账测试", 10, LocalDateTime.now().minusMinutes(1))).id();
+        // 直接操作 Redis 造出「用户已成功但 DB 无记录」（模拟 MQ 丢失）
+        redis.opsForSet().add(RedisKeys.enrolled(aid), "1001");
+        redis.opsForValue().set(RedisKeys.stock(aid), "9");
+
+        ReconciliationReport r = reconciliation.reconcile(aid);
+        assertThat(r.inRedisNotInDb()).isEqualTo(1);
+        assertThat(r.inDbNotInRedis()).isEqualTo(0);
+
+        await().atMost(10, SECONDS).until(() -> registrationRepository.count() == 1);
+        assertThat(redis.opsForSet().isMember(RedisKeys.enrolled(aid), "1001")).isTrue();  // 没被删
+        assertThat(redis.opsForValue().get(RedisKeys.stock(aid))).isEqualTo("9");           // 没被回滚
+    }
+    @Test void consistentStateProducesZeroDiff() throws Exception { /* 两条差集都为 0 */ }
+}
+```
+
+- [ ] **Step 2: 实现补偿链**
+
+按 D6 顺序接到 `LuaRegistrationService` 的 L2 分支：`publisher.publish(...)` 返回 false → 立刻同步落库；同步落库也抛异常 → `WalWriter.append(event)`。`WalReplayer` 定时（30 秒）重放，成功补写即打 `wal_replayed_total`。
+
+`ReconciliationService.reconcile` 用 `SMEMBERS enrolled:{aid}` 与 `SELECT user_id FROM registration WHERE activity_id=? AND status='CONFIRMED'` 做集合差：`inRedisNotInDb` 的**补写**，`inDbNotInRedis` 的**只告警不删 DB 记录**（D1：不得删除记录）。定时执行（60 秒），差异写进 `reconcile_missing_in_db_total` 与 ERROR 日志。
+
+- [ ] **Step 3: `WalWriterTest`**
+
+```java
+class WalWriterTest {
+    @Test void appendRoundTrips(@TempDir Path dir) throws Exception {
+        new WalWriter(dir.resolve("wal.log")).append(new RegistrationEvent(1L, 1001L, EventType.CREATE, "e1"));
+        assertThat(Files.readString(dir.resolve("wal.log"))).contains("\"eventId\":\"e1\"");
+    }
+}
+```
+
+- [ ] **⛔ 停下来：作者亲手跑**
+
+停掉 broker（`bin/chaos/mq-stop.sh`，这个脚本阶段 X 才正式写，这里手动 `shutdown broker` 即可），打一次报名——用户应该看到「报名成功」，DB 里暂时没有行。重启 broker，等对账跑一轮，确认行被补上、`reconcile_missing_in_db_total` 有计数、**Redis 库存没被回滚**。这是 D1「成功即事实」的现场演示。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add -A && git commit -m "feat: 失败补偿链（MQ→同步→WAL→对账）与对账指标"
+```
+
+---
+
+# 阶段 L3：活动详情多级缓存
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/cache/{ActivityCacheService,SingleFlightLoader}.java`
+- Create: `src/main/resources/application-l3.yml`
+- Test: `src/test/java/com/winter/reg/cache/ActivityCacheServiceTest.java`
+
+**Interfaces:**
+- Produces:
+  - `ActivityCacheService.get(Long activityId) -> ActivityResponse`（`null` 表示不存在，也被缓存）
+  - `ActivityCacheService.invalidate(Long activityId)`
+  - `SingleFlightLoader.<T> T load(String key, Supplier<T> loader)`
+  - `application-l3.yml`：`winter.cache.enabled=true`
+
+- [ ] **Step 1: 实现 + 测试**
+
+`ActivityCacheService` 查询顺序 Caffeine → Redis → DB 逐层回源。三件套对着设计文档 7.3：**防穿透**用「不存在的活动也缓存空值（短 TTL）」；**防击穿**用 `SingleFlightLoader`（`ConcurrentHashMap<String, CompletableFuture<?>>`，不引第三方库）；**防雪崩**用随机 TTL（`baseTtl + random(0, jitter)`）。Caffeine 与 Redis 同量级并加抖动。`invalidate` 同时清本地与 Redis。
+
+```java
+@Test void secondReadServedFromLocalCache_notFromDb() {
+    assertThat(cache.get(aid).title()).isEqualTo("缓存测试");
+    repository.deleteById(aid); repository.flush();     // 直接删库里的行
+    assertThat(cache.get(aid).title()).isEqualTo("缓存测试");  // 本地缓存仍命中
+    cache.invalidate(aid);
+    assertThat(cache.get(aid)).isNull();                 // 失效后回源，拿到不存在
+}
+@Test void concurrentMiss_triggersSingleDbLoad() throws Exception {
+    int threads = 50;                                    // 50 个并发未命中
+    /* 全部 start.countDown() 后同时调 cache.get(aid) */
+    assertThat(ActivityCacheService.getDbLoadCount()).isEqualTo(1);   // 只 1 次 DB 查询
+}
+```
+
+- [ ] **⛔ 停下来 + 压测**
+
+```bash
+git add -A && git commit -m "feat: 活动详情多级缓存（穿透/击穿/雪崩三件套）"
+bin/bench.sh l3 3000 60 500
+```
+`GET /api/activities/{id}` 的 QPS 应显著高于 L2。报告记录缓存命中率。
+
+---
+
+# 阶段 L4：限流与频控
+
+**Files:**
+- Create: `src/main/java/com/winter/reg/ratelimit/{RateLimitFilter,SlidingWindowCounter,TokenBucket}.java`
+- Create: `src/main/resources/application-l4.yml`
+- Test: `src/test/java/com/winter/reg/ratelimit/RateLimitTest.java`
+
+**Interfaces:**
+- Produces:
+  - `TokenBucket(long capacityPerSecond)` —— `boolean tryAcquire()`
+  - `SlidingWindowCounter(int maxPerWindow, Duration window)` —— `boolean tryAcquire(String key)`
+  - `RateLimitFilter` —— `OncePerRequestFilter`，对 `/api/registrations/**` 生效，超限返回 `ApiResponse.fail(ResultCode.RATE_LIMITED)`
+  - `application-l4.yml`：`winter.ratelimit.enabled=true`、`winter.ratelimit.bucket-per-second`、`winter.ratelimit.per-user-per-activity-per-second`
+
+- [ ] **Step 1: 先写失败的 `RateLimitTest`**
+
+```java
+@Test void tokenBucketAllowsUpToCapacityThenRejects() {
+    TokenBucket b = new TokenBucket(10);
+    int ok = 0; for (int i = 0; i < 50; i++) if (b.tryAcquire()) ok++;
+    assertThat(ok).isEqualTo(10);
+}
+@Test void slidingWindowCountsPerKeyIndependently() {
+    SlidingWindowCounter c = new SlidingWindowCounter(3, Duration.ofSeconds(1));
+    assertThat(c.tryAcquire("u1")).isTrue(); assertThat(c.tryAcquire("u1")).isTrue();
+    assertThat(c.tryAcquire("u1")).isTrue(); assertThat(c.tryAcquire("u1")).isFalse();  // 第 4 次
+    assertThat(c.tryAcquire("u2")).isTrue();                                            // 别人不受影响
+}
+@Test void windowSlides_afterExpiryAllowedAgain() throws Exception { /* sleep 260ms 后又放行 */ }
+```
+
+- [ ] **Step 2: 实现**
+
+`TokenBucket` 用 `ScheduledExecutorService` 定时补令牌。`SlidingWindowCounter` 每 key 一个 `ArrayDeque<Long>` 存时间戳，`tryAcquire` 先清窗口外的再看 size。`RateLimitFilter` 先过全局桶、再过 `userId:activityId` 滑动窗口，任一超限返回 `RATE_LIMITED`（HTTP 200 + `code=1006`，与全局 HTTP 契约一致）。`winter.ratelimit.enabled=false` 时过滤器直接放行——**L0–L3 的压测数字因此不会被限流污染**。
+
+- [ ] **⛔ 停下来 + 压测**
+
+```bash
+git add -A && git commit -m "feat: 令牌桶限流与单用户滑动窗口频控"
+bin/bench.sh l4 3000 60 500
+```
+Expected: `VERIFY PASSED`。报告记录被限流比例与错误码分布——限流的意义不是拦住所有人，是超载时明确拒绝而不是拖垮服务。
+
+---
+
+# 阶段 X：故障注入
+
+**Files:**
+- Create: `bin/chaos/{redis-kill,mq-stop,mq-start,mysql-delay,mysql-delay-clear}.sh`
+- Create: `docs/benchmarks/chaos-results.md`
+
+- [ ] **Step 1: 写注入脚本**
+
+`redis-kill.sh`：`redis-cli SHUTDOWN NOSAVE`。`mq-stop.sh`/`mq-start.sh`：停/起 broker（namesrv 不动）。`mysql-delay.sh`：给 `winter` 库的连接注入延迟（优先用不波及本机其他库的手段，例如只对应用连接设 `max_execution_time` 或 `tc qdisc` 限定 3306 端口）。**每个脚本第一行打印它要做什么、第二行打印恢复方式**，且只作用于本项目的库/端口。
+
+- [ ] **Step 2: 场景一 —— 压测中杀 Redis**
+
+`bin/bench.sh l2 3000 60 500`，第 20 秒 `bin/chaos/redis-kill.sh`，跑完 `bin/verify.sh`。
+Expected: `VERIFY PASSED`——证明 D2 降级链路生效：Redis 挂了走 MySQL 条件更新，不多不少。记录 QPS 跌幅与错误码分布。
+
+- [ ] **Step 3: 场景二 —— 停 MQ 一段时间后恢复**
+
+第 15 秒 `mq-stop.sh`，第 35 秒 `mq-start.sh`。
+Expected: `VERIFY PASSED` 且对账最终补平（`reconcile_missing_in_db_total` 归零）——证明 D1「只补写」没丢单。
+
+- [ ] **Step 4: 场景三 —— MySQL 注入延迟**
+
+第 20 秒注入 200ms，第 40 秒清除。
+Expected: 用户路径 P99 不被拖垮（报名链路在 Redis 侧完成，落库异步）；MQ 堆积上升但最终追平。记录堆积曲线。
+
+- [ ] **Step 5: 写结论并提交**
+
+三个场景各一节：注入了什么、观察到的指标变化、验证了什么设计决定、暴露了什么新问题。**这一份文件就是 DoD 里「至少 2 个故障注入场景有记录与结论」的交付物。**
+
+```bash
+git add -A && git commit -m "feat: 三个故障注入场景及结论记录"
+```
+
+---
+
+# 阶段 V：极简 Vue 前端
+
+**Files:**
+- Create: `web/{package.json,vite.config.js,index.html}`
+- Create: `web/src/{main.js,App.vue,api.js}`
+- Create: `web/src/views/{ActivityList,ActivityDetail,MyRegistrations}.vue`
+- Modify: `src/main/java/com/winter/reg/config/WebConfig.java`（CORS）
+
+- [ ] **Step 1: 契约测试（防后人改回靠 HTTP 码判成败）**
+
+```java
+@SpringBootTest
+class WebContractTest {
+    @Autowired MockMvc mvc;
+    @Test void registrationResponseHasCodeField_forFrontend() throws Exception {
+        mvc.perform(post("/api/registrations/1").header("Authorization", "Bearer x"))
+           .andExpect(jsonPath("$.code").isNumber());
+    }
+}
+```
+
+- [ ] **Step 2: 搭 Vue 3 + Vite**
+
+`npm create vite@latest web -- --template vue`，装 `vue`、`vue-router`、`axios`。`vite.config.js` 设 `server.proxy` 把 `/api` 转 `localhost:8080`。**不上 Pinia/Element Plus/TS**——非目标已排除「精致前端」。
+
+- [ ] **Step 3: 三个视图**
+
+`ActivityList.vue`：列出 `status=OPEN` 的活动（标题、剩余名额、开抢时间）。`ActivityDetail.vue`：详情 + 「报名」按钮，按 `code` 显示「报名成功 / 已满 / 已报名 / 未开始 / 请求过于频繁」。`MyRegistrations.vue`：我的报名 + 「取消」。登录注册最简表单，token 存 `localStorage`。
+
+- [ ] **⛔ 停下来 + 提交**
+
+`WebConfig` 放行 `localhost:5173`。浏览器走一遍「登录 → 看活动 → 报名 → 我的报名 → 取消」。
+
+```bash
+git add -A && git commit -m "feat: 极简 Vue 前端（列表/详情/报名/取消）"
+```
+
+---
+
+## 阶梯数据采集清单
+
+| 级别 | 命令 | 必记指标 |
+|---|---|---|
+| L0 | `bin/bench.sh l0 3000 60 500` | QPS / P99 / 错误率 / 超卖数=0（基线） |
+| L1 | `bin/bench.sh l1 3000 60 500` | 同上 + Redis 命中率 |
+| L2 | `bin/bench.sh l2 3000 60 500` | 同上 + MQ 堆积/消费延迟 |
+| L3 | `bin/bench.sh l3 3000 60 500` | 同上 + 缓存命中率 |
+| L4 | `bin/bench.sh l4 3000 60 500` | 同上 + 被限流比例、错误码分布 |
+| X | 三个故障场景 | 现象 + 结论 |
+
+## 自检记录（writing-plans Self-Review）
+
+1. **Spec coverage**：7.1 链路 → L0/L1/L2；7.2 三层防线 → 阶段 0(schema/唯一索引)、L1(Lua)、L0(条件更新)；7.2 幂等 → L0/L1/L2；7.2 取消 → L1.5；7.2 失败补偿 → L2.5；7.3 削峰 → L2；7.3 缓存 → L3；7.3 限流 → L4；7.4 数据模型 → 阶段 0；7.5 阶梯 → 全部 + 采集清单；第 8 节证据链 → 阶段 P/X + 阶段 0 的指标；D1–D8 → L2.5(D1/D6)、阶段0+L1(D2)、阶段0(D3)、阶段P(D4/D5)、阶段0+P(D7)、阶段V(D8)。第 10 节 DoD → 阶段 P 的三条命令、阶段 X 的故障记录、阶段 0 的监控。
+2. **Step scan**：代码块只出现在「签名与测试无法确定」的地方（Lua 脚本、SQL schema、verify.sh 断言、测试断言），函数体一律不写。
+3. **Type consistency**：`RegistrationService.register(Long, Long) -> RegResult` 在 L0/L1/L1.5/L2 一致；`RegistrationScripts.grab(Long, Long, int) -> GrabCode` 在 L1/L1.5 一致；`ApiResponse<T>(int code, String msg, T data)` 在阶段 0 之后一致；`RedisKeys` 键名在所有阶段逐字相同。
+4. **Review Focus**：5 条各有归属（表内已列），另补 `capacity<=0`（阶段 0/L0）与压测机瓶颈（阶段 P）。
+5. **Proportion**：设计文档 194 行，本计划约 590 行。比 v1 短 55%，主要靠两件事：合并了 v1 里拆得过细的任务（如「活动 CRUD」不再单独成任务），以及去掉了每个任务重复的 Interfaces 块。
+
+**v2 相对 v1 的三个改动（都是应作者 m00323 的要求）：**
+1. **按级别重组，每级一个「⛔ 停下来」闸门**，顺序固定为 实现 → 作者跑 → 提交 → 压测 → 下一级。
+2. **报名链路开关从一个枚举 `winter.registration.flow`（`L0`/`L1`/`L2`）取代 v1 的 `deduct`+`persist` 两个旋钮**——两个旋钮能组合出 `deduct=DB, persist=MQ` 这种无意义状态。缓存与限流保持独立开关，因为它们不改变报名逻辑。
+3. **TDD 只保留在测试本身就是正确性证明的阶段**（L0、L1、L1.5、L2、L2.5、L4、JWT）；阶段 0 的骨架/CRUD、阶段 P、L3、阶段 X、阶段 V 改为手工验证。理由见下。
+
+## 关于「为什么先写失败测试」
+
+这个纪律的价值**不在顺序，在断言**。本项目真正会骗人的是这两类测试：
+
+- **并发测试**：写成 `pool.submit(...)` 但循环里 `f.get()` 了，实际串行执行，400 线程抢 100 名额当然全过——它没测到并发。
+- **上限断言写成 `<=`**：`assertThat(success <= 100)` 会把「名额被吞」（只成交 80 个）也算成通过。
+
+`assertThat(success).isEqualTo(100)` 才是这两个测试的全部价值。而先写测试再写实现，只是让人有机会看见「这个测试确实会红」——对 CRUD、UI、脚手架，这一步纯属仪式，所以本计划把它们降级成手工验证。
+
+对 Lua 脚本、JWT、幂等消费、对账补写这几处，先写测试仍然值得：它们的失败模式是「看起来对但不验签」「重复投递产生两行」这种不跑测试发现不了的事。
