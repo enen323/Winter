@@ -165,7 +165,9 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 
 **D6 发送消息失败的处理：**降级为同步落库；同步落库也失败则写本地文件 WAL 后台重放，对账任务最后兜底。理由：内存队列在进程崩溃时丢单，而这里丢的是“用户已被告知成功”的单。
 
-**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。隔离级别用 **READ-COMMITTED**，通过 JDBC URL 的 session 变量设置（`sessionVariables=transaction_isolation=READ-COMMITTED'`），**不改全局配置**——本机还有其他项目的库，全局改动会波及它们。理由：RR 的间隙锁在本场景（同一行库存被大量并发更新 + 唯一索引插入）下更容易死锁；且 MySQL 在架构中只是耐久账本，Redis 才是判定点，不需要 RR 的快照语义。
+**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。隔离级别用 **READ-COMMITTED**，通过 JDBC URL 的 session 变量设置（`sessionVariables=transaction_isolation='READ-COMMITTED'`），**不改全局配置**——本机还有其他项目的库，全局改动会波及它们。理由：RR 的间隙锁在本场景（同一行库存被大量并发更新 + 唯一索引插入）下更容易死锁；且 MySQL 在架构中只是耐久账本，Redis 才是判定点，不需要 RR 的快照语义。
+
+## 12. 报名结果语义（已定：同步终态）
 
 用户点下报名后：
 
