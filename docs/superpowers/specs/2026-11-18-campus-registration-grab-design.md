@@ -47,8 +47,8 @@
 | Maven | 3.10.0 | `/opt/apache-maven-3.10.0` |
 | JMeter | 5.6.3 | `/opt/jmeter`（GUI 已验证可启动） |
 | RocketMQ | 5.5.1 | `/opt/rocketmq`，namesrv 9876 / broker 10911，**已在 Java 21 上验证收发** |
-| MySQL 8 | 待装 | apt |
-| Redis 7 | 待装 | apt |
+| MySQL | 8.4.13 | apt，`127.0.0.1:3306`，TLS1.3（`Ssl_cipher=TLS_AES_128_GCM_SHA256`），root 为 `caching_sha2_password`，active + enabled |
+| Redis | 8.0.5 | apt，`127.0.0.1:6379`，**AOF everysec + RDB 已开启**（`appendonlydir` 有 base.rdb + incr.aof），keyspace 干净，active + enabled |
 
 RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，超出本机负荷，需以 `JAVA_OPT_EXT` 覆盖（namesrv 1g、broker 2g）。
 - 压测工具：JMeter 为主（Java 生态、脚本可版本化），必要时用 wrk 交叉验证。
@@ -165,7 +165,7 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 
 **D6 发送消息失败的处理：**降级为同步落库；同步落库也失败则写本地文件 WAL 后台重放，对账任务最后兜底。理由：内存队列在进程崩溃时丢单，而这里丢的是“用户已被告知成功”的单。
 
-**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。隔离级别用 **READ-COMMITTED**，通过 JDBC URL 的 session 变量设置（`sessionVariables=transaction_isolation='READ-COMMITTED'`），**不改全局配置**——本机还有其他项目的库，全局改动会波及它们。理由：RR 的间隙锁在本场景（同一行库存被大量并发更新 + 唯一索引插入）下更容易死锁；且 MySQL 在架构中只是耐久账本，Redis 才是判定点，不需要 RR 的快照语义。
+**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。**隔离级别保持默认 REPEATABLE-READ，不做调整**（作者决定）。理由：主流高并发教程与生产实践多沿用默认值，且本场景的库存更新走主键唯一查找（`WHERE id = ? AND stock > 0`），只产生行锁、不触发间隙锁，死锁概率不高。附带约定：压测数据中必须统计 deadlock 次数（`ERROR 1213 (40001): Deadlock found when trying to get lock`），若在 L1/L2 阶梯出现，修复手段只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`（一行、可逆、不动全局配置，不波及本机其他项目的库）。
 
 ## 12. 报名结果语义（已定：同步终态）
 
