@@ -167,6 +167,8 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 
 **D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。**隔离级别保持默认 REPEATABLE-READ，不做调整**（作者决定）。理由：主流高并发教程与生产实践多沿用默认值，且本场景的库存更新走主键唯一查找（`WHERE id = ? AND stock > 0`），只产生行锁、不触发间隙锁，死锁概率不高。附带约定：压测数据中必须统计 deadlock 次数（`ERROR 1213 (40001): Deadlock found when trying to get lock`），若在 L1/L2 阶梯出现，修复手段只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`（一行、可逆、不动全局配置，不波及本机其他项目的库）。
 
+**D8 前端形态：极简 Vue 页面（作者拍板）。** 不做 Thymeleaf 服务端渲染。理由：前端在本项目只承担「能点、能看结果」（报名成功/失败、我的报名列表），压测不依赖前端（见第 3 节非目标）；前后端分离还能让报名接口独立压测、不被页面渲染干扰。D1 已明确前端可直接展示返回值，因此不需要轮询接口。
+
 ## 12. 报名结果语义（已定：同步终态）
 
 用户点下报名后：
@@ -187,7 +189,6 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 ## 13. 留给实现者的部分
 
 - 具体依赖版本号、包结构、表字段类型与索引细节。
-- MQ 产品最终选型（RocketMQ / RabbitMQ）与消息格式、重试与死信策略。
+- MQ 的消息格式、重试与死信策略。
 - 压测参数取值（并发梯度、时长）、限流阈值初值（由 L0 数据反推）。
 - 取消后重新报名的记录语义（复用记录 vs 部分唯一索引）的具体实现。
-- 前端页面形态（Thymeleaf 服务端渲染或极简 Vue 页面）。
