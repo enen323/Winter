@@ -38,8 +38,19 @@
 ## 5. 约束
 
 - 语言与框架：Java + Spring Boot（开发者主力栈）。
-- 部署形态：单机 Docker Compose（MySQL、Redis、MQ、应用）。开发机基线：16 核 / 30GB 内存，压测与应用同机（数字口径在文档中如实标注，不宣称多机结论）。
-- 中间件选取主流稳定版：MySQL 8、Redis 7、RocketMQ 或 RabbitMQ（实现时择一，以“削峰”为唯一诉求，不做选型炫技）。
+- **不使用 Docker**：机器上装有飞连（corplink）安全客户端，会把 Docker 识别为风险软件。MySQL、Redis、RocketMQ 均本机直装，`make up` 由启动脚本实现（健康检查 + 灌数据），等价于 compose 的 `--wait` 行为。
+## 5.1 环境现状（2026-11-21 已就绪）
+
+| 组件 | 版本 | 位置 / 启动方式 |
+|------|------|----------------|
+| JDK | OpenJDK 21.0.13.1 | `/usr/lib/jvm/java-21-openjdk-amd64` |
+| Maven | 3.10.0 | `/opt/apache-maven-3.10.0` |
+| JMeter | 5.6.3 | `/opt/jmeter`（GUI 已验证可启动） |
+| RocketMQ | 5.5.1 | `/opt/rocketmq`，namesrv 9876 / broker 10911，**已在 Java 21 上验证收发** |
+| MySQL 8 | 待装 | apt |
+| Redis 7 | 待装 | apt |
+
+RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，超出本机负荷，需以 `JAVA_OPT_EXT` 覆盖（namesrv 1g、broker 2g）。
 - 压测工具：JMeter 为主（Java 生态、脚本可版本化），必要时用 wrk 交叉验证。
 - 不在本阶段产生云主机等持续费用。
 
@@ -110,7 +121,7 @@
 
 ## 8. 证据链（STAR 里 R 的来源）
 
-- **压测**：脚本入库，参数（并发数、持续时长、目标活动名额）可配置，一条命令复跑；每轮产出 `docs/benchmarks/YYYY-MM-DD-Lx-<说明>.md`，含配置、原始结果、结论。
+- **压测**：脚本入库，参数（并发数、持续时长、目标活动名额）可配置，一条命令复跑；每轮产出 `docs/benchmarks/YYYY-MM-DD-Lx-<说明>.md`，含配置、原始结果、结论。工具为 JMeter 5.6.3（非 GUI 模式 + `-e -o` 出 HTML 报告），`.jmx` 入库。
 - **指标**：QPS、P50/P99/P999 延迟、错误率、CPU/内存、Redis 命中率、MQ 堆积量。Prometheus + Grafana（Spring Actuator + Micrometer）。
 - **正确性校验**：压测后自动断言 `DB 成功报名数 == 名额上限` 且 `无重复 (activity_id,user_id)` 且 `Redis 库存 == 0`；校验脚本随压测一起跑。
 - **故障注入**：至少覆盖 ①压测中杀 Redis（验证降级与不超卖）②停 MQ 一段时间后恢复（验证不丢单、对账生效）③MySQL 注入延迟（验证用户路径不被拖垮）。每个场景记录现象与结论。
