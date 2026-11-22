@@ -15,7 +15,7 @@
 
 以下每条对每个阶段隐式生效，值从设计文档逐字复制：
 
-- **不使用 Docker**：机器装有飞连（corplink）安全客户端，会把 Docker 识别为风险软件。MySQL/Redis/RocketMQ 本机直装。`make up` 由 `bin/up.sh` 实现（健康检查 + 灌数据）。
+- **不使用 Docker**：机器装有飞连（corplink）安全客户端，会把 Docker 识别为风险软件。MySQL/Redis/RocketMQ 本机直装。**不写启动脚本**——作者用 IDEA 启动应用（要断点观察），中间件手动起。
 - **三层防超卖，任一层都无法单独造成超卖**：①Redis Lua 原子扣减 ②MySQL `UPDATE ... WHERE stock > 0` 影响行数兜底 ③`uk_activity_user(activity_id, user_id)` 唯一索引。
 - **Redis 是名额判定唯一权威点**，MySQL 不是判定点（L0 降级链路除外）。
 - **成功即事实（D1）**：Redis 扣减成功即返回「报名成功」，不可撤销；落库失败只能由对账补写并告警，**不得回滚库存或删除记录**。
@@ -24,7 +24,7 @@
 - **取消后重新报名复用同一行**（D5）：`status` 从 `CANCELED` 改回 `CONFIRMED`、更新 `updated_at`，不产生第二条记录。
 - **MySQL 隔离级别保持默认 REPEATABLE-READ，不调整**（D7）。若压测出现 `ERROR 1213 (40001): Deadlock found when trying to get lock`，修复只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`。
 - **压测有效性 5 前提**（违反任意一条整轮数据作废）：①并发请求必须用互不相同的 userId（CSV 数据集注入）②预签发 token ③成功判定以响应体结果码为准（配响应断言）④同步定时器模拟瞬间洪峰 ⑤评估压测机自身是否成为瓶颈。
-- **一条命令起全栈、一条命令压测、一条命令校验正确性**（DoD）。
+- **一条命令压测、一条命令校验正确性**（DoD；原「一条命令起全栈」已取消，见下）。
 - 本阶段不做：SSO、支付、通知、签到核销、主办方审核、抽签摇号、微服务/K8s/分库分表。
 - **每一级必须单独跑一次完整压测 + verify**，不能只跑最终架构再反推中间数字（设计文档反目标：优化痕迹丢失）。
 
@@ -77,11 +77,6 @@
 - Create: `src/main/java/com/winter/reg/web/dto/{ActivityRequest,ActivityResponse,RegisterResponse}.java`
 - Create: `src/main/java/com/winter/reg/service/ActivityService.java`
 - Create: `src/main/java/com/winter/reg/metrics/RegMetrics.java`
-- Create: `bin/up.sh`
-
-**Interfaces:**
-- Produces:
-  - `enum RegistrationStatus { CONFIRMED, CANCELED }`
   - `enum ResultCode { SUCCESS(0), FULL(1001), ALREADY(1002), NOT_STARTED(1003), CLOSED(1004), NOT_FOUND(1005), RATE_LIMITED(1006), DEGRADED(1007) }`
   - `record ApiResponse<T>(int code, String msg, T data)` —— 静态工厂 `ApiResponse.ok(data)` / `ApiResponse.fail(ResultCode)`
   - `final class JwtService { JwtService(String secret, Duration ttl); String issue(Long userId, String username); JwtPayload verify(String token) throws JwtException; }`
@@ -152,14 +147,26 @@ Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后
 
 `AuthController`：注册用 BCrypt 哈希，登录返回 token。`JwtAuthFilter` 解析 `Authorization: Bearer <token>`，`/api/auth/**` 放行，其余 `/api/**` 拦截。`ActivityService.create` 校验 `capacity > 0`（否则 `IllegalArgumentException` → `GlobalExceptionHandler` 映射为 `code=1500`）——这是 Review Focus 里 `capacity<=0` 的第一道防线。`RegMetrics` 用 Micrometer `Counter` 命名 `registration_success_total` / `registration_full_total` / `registration_already_total` / `registration_not_started_total` / `registration_closed_total` / `registration_rate_limited_total` / `reconcile_missing_in_db_total` / `wal_replayed_total` / `mq_dead_lettered_total`，`application.yml` 暴露 `prometheus,health,metrics`。
 
-- [ ] **Step 5: `bin/up.sh`**
+- [ ] **Step 5: 确认起栈方式（不写 `bin/up.sh`）**
 
-一条命令起全栈：探测 MySQL 3306 / Redis 6379 / RocketMQ namesrv 9876 / broker 10911，未就绪则启动（RocketMQ 用 `JAVA_OPT_EXT="-Xms1g -Xmx1g"` 覆盖 namesrv、`"-Xms2g -Xmx2g"` 覆盖 broker——**脚本默认 `-Xms8g -Xmx8g`+`MaxDirectMemorySize=15g` 本机扛不住**）；全就绪后启动 Spring Boot；打印 `READY http://localhost:8080/actuator/health`。**不硬编码 broker 名**（重启后可能从 `broker-a` 变 `HP`），用 namesrv 地址寻址。
+作者用 IDEA 启动 `WinterApplication`——要断点观察代码逻辑，所以不需要一键启动脚本。各组件就位方式：
+
+| 组件 | 怎么起 |
+|---|---|
+| MySQL | 系统服务，已 `enabled`，通常开机就在；`systemctl status mysql` 确认 |
+| Redis | 系统服务，已 `enabled`；`systemctl status redis-server` 确认 |
+| RocketMQ namesrv | `JAVA_OPT_EXT="-Xms1g -Xmx1g" sh /opt/rocketmq/bin/mqnamesrv &` |
+| RocketMQ broker | `JAVA_OPT_EXT="-Xms2g -Xmx2g" sh /opt/rocketmq/bin/mqbroker &` |
+| 应用 | IDEA 跑 `WinterApplication` |
+
+**RocketMQ 必须带 `JAVA_OPT_EXT`**：`runbroker.sh` 默认 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，本机扛不住。
+
+`bin/bench.sh` 自己起应用（JMeter 要无头跑），与 IDEA 手动启动是两条独立路径，互不影响。
 
 - [ ] **⛔ 停下来：作者亲手跑**
 
 ```bash
-bash bin/up.sh
+# IDEA 启动 WinterApplication，然后：
 curl -s localhost:8080/actuator/health                      # 期望 {"status":"UP"}
 curl -s -XPOST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'
 curl -s -XPOST localhost:8080/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'   # 拿到 token
@@ -173,7 +180,7 @@ curl -s localhost:8080/api/activities
 - [ ] **Step 6: 提交**
 
 ```bash
-git add -A && git commit -m "feat: 底座（Schema、JWT、活动 CRUD、最小指标、一键起全栈）"
+git add -A && git commit -m "feat: 底座（Schema、JWT、活动 CRUD、最小指标）"
 ```
 
 ---
