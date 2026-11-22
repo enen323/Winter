@@ -170,6 +170,10 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 
 **D8 前端形态：极简 Vue 页面（作者拍板）。** 不做 Thymeleaf 服务端渲染。理由：前端在本项目只承担「能点、能看结果」（报名成功/失败、我的报名列表），压测不依赖前端（见第 3 节非目标）；前后端分离还能让报名接口独立压测、不被页面渲染干扰。D1 已明确前端可直接展示返回值，因此不需要轮询接口。
 
+**D9 持久层框架：MyBatis-Plus 3.5.18.1（作者拍板，换掉原定的 JPA/Hibernate）。** 作者熟悉 MyBatis-Plus，且本项目核心就是几条手写 SQL（原子扣减、占位、复用行），MyBatis-Plus 的 `BaseMapper` + `@Select`/`@Update` 比 JPA 的 `@Modifying @Query` 更直接，每条 SQL 在日志里是明文。**已知损失**：MyBatis-Plus 不会像 JPA 的 `ddl-auto=validate` 那样启动时校验实体与表结构，列名写错要等运行到那条 SQL 才报错；缓解手段是 `logging.level.com.winter.reg.mapper: debug` 让每条 SQL 可见，以及 schema 只有 Flyway 一个来源。
+
+**D10 保留 Spring Boot Actuator 与「业务失败一律 HTTP 200」（作者拍板：维持现状，不删不改）。** 曾考虑删掉 `management.endpoints.web.exposure.include` 并把业务失败改成真实状态码，作者决定维持。记录理由免得后续反复：Actuator 的 `http.server.requests` 指标确实与 JMeter Aggregate Report 的分位数/吞吐量重复，但本项目 HTTP 契约是业务失败一律 200、基础设施故障才 5xx，JMeter 的「错误率」列因此恒为 0%，Actuator 的 `health` 是唯一能一眼看出「应用活着」的地方；改成真实状态码会让 3000 线程抢 500 名额的场景显示 83% 错误率，纯噪声。
+
 ## 12. 报名结果语义（已定：同步终态）
 
 用户点下报名后：

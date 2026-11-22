@@ -5,17 +5,19 @@ spring:
     # 默认值只是为了 IDEA 直接跑得动；真上线前用环境变量 WINTER_DB_PASSWORD 覆盖，
     # 密码不要写死在这个会被提交到 GitHub 的文件里。
     password: ${WINTER_DB_PASSWORD:winter}
-  jpa:
-    # schema 由 Flyway 管，Hibernate 只校验映射是否对得上——对不上就启动失败，
-    # 比等到 L0 查不出超卖原因时再发现映射错了要早得多。
-    hibernate.ddl-auto: validate
-    open-in-view: false
+  # schema 由 Flyway 管。注意：MyBatis-Plus 不会像 JPA 的 ddl-auto=validate 那样
+  # 启动时比对实体与表结构，列名写错要等运行到那条 SQL 才报错。
   flyway:
     enabled: true
   data:
     redis:
       host: 127.0.0.1
       port: 6379
+
+# L0 起核心就是几条手写 SQL（扣库存、占位、复用行），把 mapper 的 SQL 打开便于观察。
+logging:
+  level:
+    com.winter.reg.mapper: debug
 
 server:
   # 不用默认的 8080：本机跑着 ZooKeeper，它的 AdminServer 默认占 8080
