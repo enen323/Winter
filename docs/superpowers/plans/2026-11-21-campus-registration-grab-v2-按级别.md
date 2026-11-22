@@ -200,22 +200,24 @@ Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后
 
 压测时应用同样由 IDEA 起——故障注入场景要在降级分支上看断点，无头跑反而看不到。
 
+**端口是 8081 不是 8080**：本机 ZooKeeper 的 AdminServer 默认占 8080（`/opt/zookeeper/conf/zoo.cfg` 没配 `admin.serverPort`），应用用 8080 会 `BindException: 地址已在使用`。ZooKeeper 与本项目无关（RocketMQ 5.x 用自己的 NameServer `:9876`，不走 ZK），所以没去动它，是应用换了端口。
+
 - [ ] **⛔ 停下来：作者亲手跑**（AI 已用 `java -jar` 全通验证过一遍，作者仍需自己在 IDEA 里跑一次）
 
 ```bash
 # IDEA 启动 WinterApplication，然后：
-curl -s localhost:8080/actuator/health                      # 期望 {"status":"UP"}
-curl -s -XPOST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'
-curl -s -XPOST localhost:8080/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'   # 拿到 token
+curl -s localhost:8081/actuator/health                      # 期望 {"status":"UP"}
+curl -s -XPOST localhost:8081/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'
+curl -s -XPOST localhost:8081/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'   # 拿到 token
 TOKEN=...; AID=...
-curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"title":"抢名额测试","capacity":100,"startTime":"2026-11-22T12:00:00"}'
-curl -s localhost:8080/api/activities/$AID
-curl -s localhost:8080/api/activities
+curl -s -XPOST localhost:8081/api/activities -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"title":"抢名额测试","capacity":100,"startTime":"2026-11-22T12:00:00"}'
+curl -s localhost:8081/api/activities/$AID
+curl -s localhost:8081/api/activities
 ```
 
 确认：无 token 的 `/api/**` 被拒（`code=1400`）、注册/登录/建活动/查活动四步全通、`capacity=0` 被拒（`code=1500`）。
 
-`curl -s localhost:8080/actuator/prometheus | grep registration` **在阶段 0 没有输出是正常的**——`RegMetrics` 推迟到 L0，届时才有第一批 `registration_*` 计数器。
+`curl -s localhost:8081/actuator/prometheus | grep registration` **在阶段 0 没有输出是正常的**——`RegMetrics` 推迟到 L0，届时才有第一批 `registration_*` 计数器。
 
 **作者还要做的两件事**（AI 代劳不了）：
 
@@ -438,7 +440,7 @@ bin/verify.sh reset
 
 ```bash
 TOKEN=$(head -1 jmeter/tokens.csv | cut -d, -f2)
-curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" \
+curl -s -XPOST localhost:8081/api/activities -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"title":"L0 基线","capacity":500,"startTime":"2026-11-21T12:00:00"}'
 # 返回 id 应为 1（reset 已 TRUNCATE）；grab.jmx 里 activityId 填 1，之后每轮不用改
@@ -978,7 +980,7 @@ class WebContractTest {
 
 - [ ] **Step 2: 搭 Vue 3 + Vite**
 
-`npm create vite@latest web -- --template vue`，装 `vue`、`vue-router`、`axios`。`vite.config.js` 设 `server.proxy` 把 `/api` 转 `localhost:8080`。**不上 Pinia/Element Plus/TS**——非目标已排除「精致前端」。
+`npm create vite@latest web -- --template vue`，装 `vue`、`vue-router`、`axios`。`vite.config.js` 设 `server.proxy` 把 `/api` 转 `localhost:8081`。**不上 Pinia/Element Plus/TS**——非目标已排除「精致前端」。
 
 - [ ] **Step 3: 三个视图**
 

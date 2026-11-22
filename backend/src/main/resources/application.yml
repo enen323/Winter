@@ -17,6 +17,13 @@ spring:
       host: 127.0.0.1
       port: 6379
 
+server:
+  # 不用默认的 8080：本机跑着 ZooKeeper，它的 AdminServer 默认占 8080
+  # （zoo.cfg 没配 admin.serverPort），应用起不来，报 BindException 地址已在使用。
+  # ZooKeeper 与本项目无关（RocketMQ 5.x 用自己的 NameServer:9876，不走 ZK），
+  # 所以不去动它，应用换个端口。
+  port: 8081
+
 winter:
   jwt:
     # 同上：默认值是开发用的，上线前必须用 WINTER_JWT_SECRET 覆盖。
