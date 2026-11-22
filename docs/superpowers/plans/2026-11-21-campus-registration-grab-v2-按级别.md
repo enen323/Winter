@@ -74,21 +74,27 @@
 - Create: `backend/src/main/resources/application.yml`
 - Create: `backend/src/main/resources/db/migration/V1__init.sql`
 - Create: `backend/src/main/java/com/winter/reg/domain/{Activity,Registration,RegistrationStatus,User}.java`
-- Create: `backend/src/main/java/com/winter/reg/repo/{ActivityRepository,RegistrationRepository,UserRepository}.java`
+- Create: `backend/src/main/java/com/winter/reg/repo/{ActivityRepository,UserRepository}.java`
 - Create: `backend/src/main/java/com/winter/reg/auth/{JwtService,JwtAuthFilter}.java`
 - Create: `backend/src/main/java/com/winter/reg/web/{AuthController,ActivityController,ResultCode,ApiResponse,GlobalExceptionHandler}.java`
-- Create: `backend/src/main/java/com/winter/reg/web/dto/{ActivityRequest,ActivityResponse,RegisterResponse}.java`
-- Create: `backend/src/main/java/com/winter/reg/service/ActivityService.java`
-- Create: `backend/src/main/java/com/winter/reg/metrics/RegMetrics.java`
-  - `enum ResultCode { SUCCESS(0), FULL(1001), ALREADY(1002), NOT_STARTED(1003), CLOSED(1004), NOT_FOUND(1005), RATE_LIMITED(1006), DEGRADED(1007) }`
+- Create: `backend/src/main/java/com/winter/reg/web/dto/{ActivityRequest,ActivityResponse,AuthRequest,AuthResponse}.java`
+- Create: `backend/src/main/java/com/winter/reg/service/{ActivityService,AuthService}.java`
+- Create: `backend/src/main/java/com/winter/reg/auth/{JwtException,JwtPayload}.java`
+- ~~Create: `backend/src/main/java/com/winter/reg/repo/RegistrationRepository.java`~~ **推迟到 L0**：阶段 0 没有任何报名查询，`ddl-auto:validate` 只需要 entity 不需要 repository
+- ~~Create: `backend/src/main/java/com/winter/reg/web/dto/RegisterResponse.java`~~ **不建**：报名端点是 L0 的东西，阶段 0 建了是死代码
+- ~~Create: `backend/src/main/java/com/winter/reg/metrics/RegMetrics.java`~~ **推迟到 L0**：阶段 0 没有报名链路，9 个 Counter 全是死的。`application.yml` 的 actuator 暴露在阶段 0 配好
+  - `enum ResultCode { SUCCESS(0,"ok"), FULL(1001), ALREADY(1002), NOT_STARTED(1003), CLOSED(1004), NOT_FOUND(1005), RATE_LIMITED(1006), DEGRADED(1007), UNAUTHORIZED(1400), PARAM_ERROR(1500) }` —— `UNAUTHORIZED`/`PARAM_ERROR` 是认证与参数校验，报名结果用不到
   - `record ApiResponse<T>(int code, String msg, T data)` —— 静态工厂 `ApiResponse.ok(data)` / `ApiResponse.fail(ResultCode)`
   - `final class JwtService { JwtService(String secret, Duration ttl); String issue(Long userId, String username); JwtPayload verify(String token) throws JwtException; }`
   - `record JwtPayload(Long userId, String username, long iat, long exp)`
+  - `record AuthRequest(@NotBlank @Size(min=3,max=64) String username, @NotBlank @Size(min=6,max=100) String password)`
+  - `record ActivityRequest(@NotBlank @Size(max=200) String title, @Positive int capacity, @NotNull LocalDateTime startTime)` —— **没有 `stock` 字段**，库存恒等于名额由服务端初始化
   - `ActivityService.create(ActivityRequest) -> ActivityResponse` / `get(Long) -> ActivityResponse`（不存在返回 `null`）/ `listOpen() -> List<ActivityResponse>`
+  - `AuthService.register/login(AuthRequest) -> AuthResponse`；用户名重复抛 `IllegalArgumentException("用户名已被占用")`；登录失败一律抛 `IllegalArgumentException("用户名或密码错误")`，**不区分是用户名不存在还是密码错**（防枚举）
   - `POST /api/auth/register`、`POST /api/auth/login`、`POST /api/activities`、`GET /api/activities/{id}`、`GET /api/activities`
   - HTTP 契约：**所有响应 HTTP 200**，业务成败只看 body 的 `code`（`0` = 报名成功）。这是压测前提 ③ 的直接结果——用 HTTP 码判成功会把业务失败算成成功。
 
-- [ ] **Step 1: 建库与 `.gitignore`**
+- [x] **Step 1: 建库与 `.gitignore`**
 
 ```sql
 CREATE DATABASE IF NOT EXISTS winter CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
@@ -98,7 +104,7 @@ GRANT ALL PRIVILEGES ON winter.* TO 'winter'@'localhost';
 
 库名 `winter` 区别于本机已有的 `fjnu_wms`/`wms`。`.gitignore` 至少：`target/`、`node_modules/`、`dist/`、`jmeter.log`、`docs/benchmarks/html-report/`。**密码不写入任何会被提交的文件**。
 
-- [ ] **Step 2: `backend/pom.xml` 与 Schema**
+- [x] **Step 2: `backend/pom.xml` 与 Schema**
 
 依赖（不引入设计文档未提及的框架）：`spring-boot-starter-web`、`-data-jpa`、`-data-redis`、`-validation`、`-actuator`、`mysql:mysql-connector-java`、`flyway-core` + `flyway-mysql`、`org.apache.rocketmq:rocketmq-client:5.5.1`、`com.github.ben-manes.caffeine:caffeine`、`micrometer-registry-prometheus`、`spring-security-crypto`（只取 BCrypt，不上整套 Spring Security）；测试用 `spring-boot-starter-test`。Java release 21。
 
@@ -130,9 +136,23 @@ CREATE TABLE registration (
 );
 ```
 
+`CREATE TABLE activity` 与 `CREATE TABLE registration` 之外还必须有 `app_user`：
+
+```sql
+CREATE TABLE app_user (
+  id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  username   VARCHAR(64)  NOT NULL,
+  password   VARCHAR(100) NOT NULL,
+  created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  CONSTRAINT uk_app_user_username UNIQUE (username)
+);
+```
+
+**表名必须是 `app_user` 不是 `user`**：MySQL 8 把 `USER` 当保留字，`CREATE TABLE user` 直接语法错误。`VARCHAR(100)` 是给 BCrypt 哈希留的（固定 60 字符）。
+
 `CHECK (stock >= 0)` 是三层防线之外的一层物理保险：任何让库存变负的 SQL 都会被数据库拒绝。
 
-- [ ] **Step 3: 先写 `JwtServiceTest`，再实现 `JwtService`**
+- [x] **Step 3: 先写 `JwtServiceTest`，再实现 `JwtService`**
 
 ```java
 class JwtServiceTest {
@@ -150,11 +170,17 @@ Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后
 
 手写 HS256 不引 jjwt：`javax.crypto.Mac` + `Base64.getUrlEncoder().withoutPadding()`，header 固定 `{"alg":"HS256","typ":"JWT"}`，payload 含 `sub`/`name`/`iat`/`exp`。`verify` 必须用 `MessageDigest.isEqual` 常量时间比较，并拒绝签名不符、解析失败、缺 `exp`、已过期。**这是安全边界，四种拒绝情况都有测试钉住。**
 
-- [ ] **Step 4: 用户体系、活动 CRUD、最小指标**
+- [x] **Step 4: 用户体系、活动 CRUD、最小指标**
 
-`AuthController`：注册用 BCrypt 哈希，登录返回 token。`JwtAuthFilter` 解析 `Authorization: Bearer <token>`，`/api/auth/**` 放行，其余 `/api/**` 拦截。`ActivityService.create` 校验 `capacity > 0`（否则 `IllegalArgumentException` → `GlobalExceptionHandler` 映射为 `code=1500`）——这是 Review Focus 里 `capacity<=0` 的第一道防线。`RegMetrics` 用 Micrometer `Counter` 命名 `registration_success_total` / `registration_full_total` / `registration_already_total` / `registration_not_started_total` / `registration_closed_total` / `registration_rate_limited_total` / `reconcile_missing_in_db_total` / `wal_replayed_total` / `mq_dead_lettered_total`，`application.yml` 暴露 `prometheus,health,metrics`。
+`AuthController`：注册用 BCrypt 哈希，登录返回 token。`JwtAuthFilter` 解析 `Authorization: Bearer <token>`，`/api/auth/**` 放行，其余 `/api/**` 拦截。`ActivityService.create` 校验 `capacity > 0`（否则 `IllegalArgumentException` → `GlobalExceptionHandler` 映射为 `code=1500`）——这是 Review Focus 里 `capacity<=0` 的第一道防线。`application.yml` 暴露 `prometheus,health,metrics`。
 
-- [ ] **Step 5: 确认起栈方式（不写 `bin/up.sh`）**
+**`RegMetrics` 已推迟到 L0**（原计划放在本步骤）：阶段 0 没有报名链路，9 个 Counter 没有任何一个会被自增，建了就是死代码。等 L0 第一个 `registration_success_total` 真正被调用时再建，届时一眼能看出哪些计数器真的在动。
+
+**认证放行的边界**：`JwtAuthFilter` 只拦 `/api/**` 且不以 `/api/auth/` 开头的请求；其余（`/actuator/**`、静态资源）直接放行。鉴权失败写 `code=1400`，同样 HTTP 200。
+
+**登录失败不区分原因**：用户名不存在和密码错误返回同一条 `"用户名或密码错误"`。返回「用户名不存在」能让攻击者枚举出已注册用户。
+
+- [x] **Step 5: 确认起栈方式（不写 `bin/up.sh`）**
 
 作者用 IDEA 启动 `WinterApplication`——要断点观察代码逻辑，所以不需要一键启动脚本。各组件就位方式：
 
@@ -168,28 +194,61 @@ Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后
 
 **RocketMQ 必须带 `JAVA_OPT_EXT`**：`runbroker.sh` 默认 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，本机扛不住。
 
+**应用怎么起**：IDEA 跑 `WinterApplication`（要断点观察）。命令行用 `java -jar backend/target/winter-reg-0.1.0-SNAPSHOT.jar`——**不要用 `mvn spring-boot:run`**，它会在 `spring-boot-buildpack-platform` 那个 jar 上卡住（aliyun 镜像下 50 秒以上无进展），先用 `mvn package -DskipTests` 打出 jar。
+
+**Flyway 接管 schema**：手工执行过 `V1__init.sql` 的话必须先 `DROP TABLE` 三张表再启动——迁移脚本是裸 `CREATE TABLE` 没有 `IF NOT EXISTS`，表已存在会让 Flyway 启动失败。
+
 压测时应用同样由 IDEA 起——故障注入场景要在降级分支上看断点，无头跑反而看不到。
 
-- [ ] **⛔ 停下来：作者亲手跑**
+- [ ] **⛔ 停下来：作者亲手跑**（AI 已用 `java -jar` 全通验证过一遍，作者仍需自己在 IDEA 里跑一次）
 
 ```bash
 # IDEA 启动 WinterApplication，然后：
 curl -s localhost:8080/actuator/health                      # 期望 {"status":"UP"}
-curl -s -XPOST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'
-curl -s -XPOST localhost:8080/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"p"}'   # 拿到 token
+curl -s -XPOST localhost:8080/api/auth/register -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'
+curl -s -XPOST localhost:8080/api/auth/login    -H 'Content-Type: application/json' -d '{"username":"probe","password":"password123"}'   # 拿到 token
 TOKEN=...; AID=...
-curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"title":"抢名额测试","capacity":100,"startTime":"2026-11-21T12:00:00"}'
+curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"title":"抢名额测试","capacity":100,"startTime":"2026-11-22T12:00:00"}'
 curl -s localhost:8080/api/activities/$AID
 curl -s localhost:8080/api/activities
 ```
 
-确认：无 token 的 `/api/**` 被拒、注册/登录/建活动/查活动四步全通、`curl -s localhost:8080/actuator/prometheus | grep registration` 有指标。**发现 bug 就地修，别带到下一级。**
+确认：无 token 的 `/api/**` 被拒（`code=1400`）、注册/登录/建活动/查活动四步全通、`capacity=0` 被拒（`code=1500`）。
+
+`curl -s localhost:8080/actuator/prometheus | grep registration` **在阶段 0 没有输出是正常的**——`RegMetrics` 推迟到 L0，届时才有第一批 `registration_*` 计数器。
+
+**作者还要做的两件事**（AI 代劳不了）：
+
+1. 在 `JwtAuthFilter.doFilterInternal` 与 `AuthService.login` 上打断点，用 curl 打一次，看 token 解析和 BCrypt 校验的真实路径——这是「报名链路怎么走的」的第一手印象。
+2. 改一次数据库密码（`ALTER USER 'winter'@'localhost' IDENTIFIED BY 'winter2'`），确认应用启动失败、日志给出可读报错，再改回来。**这一条是为了知道配置错了长什么样**，将来压测数字不对时能第一时间分辨是配置问题还是并发问题。
+
+**发现 bug 就地修，别带到下一级。**
+
+### AI 已验证的记录（2026-11-22，`java -jar` 起应用）
+
+| 检查项 | 结果 |
+| --- | --- |
+| Flyway 迁移 | `Migrating schema winter to version "1 - init"`，`flyway_schema_history` 记录 `version=1, description=init, success=1` |
+| `ddl-auto=validate` | 启动无异常 → JPA 映射与 Flyway schema 完全对得上 |
+| `mvn test` | Tests run: 5, Failures: 0, Errors: 0 — BUILD SUCCESS |
+| 注册 alice | `code=0`，返回 token（159 字符）+ userId=1 |
+| 登录 alice | `code=0`，token 能通过 |
+| 建活动 capacity=500 | `code=0`，id=1，`stock` 被服务端初始化为 500（与 capacity 同值） |
+| `GET /api/activities/1`、`GET /api/activities` | 均 `code=0`，字段完整 |
+| 无 token | `code=1400` "未登录或登录已过期" |
+| 坏 token（`Bearer garbage`） | `code=1400` |
+| `capacity=0` | `code=1500` "capacity 名额必须大于 0" |
+| 重复用户名 | `code=1500` "用户名已被占用" |
+| 错误密码 / 不存在的用户 | 都返回 `code=1500` "用户名或密码错误"（**同一条消息，不泄漏用户是否存在**） |
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add -A && git commit -m "feat: 底座（Schema、JWT、活动 CRUD、最小指标）"
+git -c user.name=peekball -c user.email=peekball@local add -A \
+  && git -c user.name=peekball -c user.email=peekball@local commit -m "feat: 底座（Schema、JWT、活动 CRUD）"
 ```
+
+**提交必须带 `-c user.name=peekball -c user.email=peekball@local`**：仓库没有配置 git 身份，直接 commit 会报 `fatal: 无法自动探测邮件地址（得到 'peekball@HP.(none)'）`。
 
 ---
 
