@@ -24,7 +24,7 @@
 - **取消后重新报名复用同一行**（D5）：`status` 从 `CANCELED` 改回 `CONFIRMED`、更新 `updated_at`，不产生第二条记录。
 - **MySQL 隔离级别保持默认 REPEATABLE-READ，不调整**（D7）。若压测出现 `ERROR 1213 (40001): Deadlock found when trying to get lock`，修复只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`。
 - **压测有效性 5 前提**（违反任意一条整轮数据作废）：①并发请求必须用互不相同的 userId（CSV 数据集注入）②预签发 token ③成功判定以响应体结果码为准（配响应断言）④同步定时器模拟瞬间洪峰 ⑤评估压测机自身是否成为瓶颈。
-- **一条命令压测、一条命令校验正确性**（DoD；原「一条命令起全栈」已取消，见下）。
+- **一条命令校验正确性**（DoD；原「一条命令起全栈」「一条命令压测」均已取消，见下）。
 - 本阶段不做：SSO、支付、通知、签到核销、主办方审核、抽签摇号、微服务/K8s/分库分表。
 - **每一级必须单独跑一次完整压测 + verify**，不能只跑最终架构再反推中间数字（设计文档反目标：优化痕迹丢失）。
 
@@ -161,7 +161,7 @@ Run: `mvn test -Dtest=JwtServiceTest` → 先 FAIL（编译错误），实现后
 
 **RocketMQ 必须带 `JAVA_OPT_EXT`**：`runbroker.sh` 默认 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，本机扛不住。
 
-`bin/bench.sh` 自己起应用（JMeter 要无头跑），与 IDEA 手动启动是两条独立路径，互不影响。
+压测时应用同样由 IDEA 起——故障注入场景要在降级分支上看断点，无头跑反而看不到。
 
 - [ ] **⛔ 停下来：作者亲手跑**
 
@@ -280,14 +280,14 @@ git add -A && git commit -m "feat: L0 报名链路（MySQL 条件更新，含并
 **Files:**
 - Create: `jmeter/grab.jmx`、`jmeter/grab-broken-same-user.jmx`、`jmeter/grab-broken-no-assertion.jmx`
 - Create: `jmeter/users.csv`（模板）、`jmeter/tokens.csv`
-- Create: `bin/seed-users.sh`、`bin/bench.sh`、`bin/verify.sh`
+- Create: `bin/seed-users.sh`、`bin/verify.sh`
 - Create: `docs/benchmarks/README.md`
 
 **Interfaces:**
 - Consumes: L0 的全部接口
 - Produces:
-  - `bin/bench.sh <level> <threads> <durationSeconds> <capacity>` —— 一条命令跑完压测+屏障+校验+汇总
-  - `bin/verify.sh <activityId>` —— 退出码非 0 即校验失败
+  - `bin/verify.sh reset` / `bin/verify.sh check <activityId> <capacity>` —— 退出码非 0 即校验失败
+  - `POST /api/admin/barrier` → 发屏障消息返回 `runId`；消费者收到 `BARRIER` 事件后在 Redis 写 `barrier:<runId>`（D5 的收敛信号）
   - `jmeter/users.csv` 每行 `userId,username`；`jmeter/tokens.csv` 每行 `userId,token`
 
 - [ ] **Step 1: `bin/seed-users.sh`**
@@ -318,6 +318,15 @@ git add -A && git commit -m "feat: L0 报名链路（MySQL 条件更新，含并
 
 - [ ] **Step 5: `bin/verify.sh`**
 
+两个子命令，压测前调一次、压测后调一次：
+
+```bash
+bin/verify.sh reset                          # 清 DB 与 Redis，准备下一轮
+bin/verify.sh check <activityId> <capacity>  # 屏障等追平 + 五条断言
+```
+
+`check` 先做 D5 的屏障：调 `POST /api/admin/barrier` 拿 `runId`，轮询 Redis `barrier:<runId>` 直到消费者写进去（超时 120 秒）。**消费者处理 `BARRIER` 时，它前面的 `CREATE`/`CANCEL` 都已处理完**——所以键一出现即可断言，不用「等 N 秒」猜。
+
 ```bash
 # 1. 成功报名数 == 名额上限
 CONFIRMED=$(mysql -N -e "SELECT COUNT(*) FROM registration WHERE activity_id=$AID AND status='CONFIRMED'")
@@ -336,27 +345,61 @@ DBSTOCK=$(mysql -N -e "SELECT stock FROM activity WHERE id=$AID")
 
 - [ ] **Step 6: 证明 verify.sh 会失败**
 
-人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh`。
+人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh check <activityId> <capacity>`。
 Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被证明会失败**，否则它的通过没有意义。
 
-- [ ] **Step 7: `bin/bench.sh`**
+- [ ] **Step 7: 不写 `bin/bench.sh` —— 压测由作者在 JMeter GUI 里手动跑（作者要求）**
+
+`bench.sh` 原本做五件事：重置环境、起应用、灌活动、跑 JMeter、屏障+校验+归档。「起应用」已由 IDEA 负责，「跑 JMeter」由作者在 GUI 里点。剩下三件各自独立，不值得合成一个脚本：
+
+**① 重置**（每轮压测前）
 
 ```bash
-bin/bench.sh <level> <threads> <durationSeconds> <capacity>
+bin/verify.sh reset
 ```
-流程：重置环境（删旧活动与 Redis 键）→ 以对应 profile 起应用 → 灌入目标活动（capacity 与入参一致，`startTime` 设为过去）→ JMeter 非 GUI + `-e -o` 出 HTML 报告 → **发屏障消息并等消费者追平**（D5：不用「等 N 秒」猜）→ 调 `bin/verify.sh` → 把 QPS/P99/错误率/超卖数写进 `docs/benchmarks/YYYY-MM-DD-L<level>-<说明>.md`。报告必须记录**压测机与应用机的资源分配**（前提 ⑤）。
+
+**② 灌活动**（用 `seed-users.sh` 生成的任意一个 token；`startTime` 必须设成过去，否则同步定时器放行后全部返回 `NOT_STARTED`）
+
+```bash
+TOKEN=$(head -1 jmeter/tokens.csv | cut -d, -f2)
+curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"L0 基线","capacity":500,"startTime":"2026-11-21T12:00:00"}'
+# 记下返回的 id，填进 jmeter/grab.jmx 的 activityId
+```
+
+**③ 跑压测**：GUI 打开 `jmeter/grab.jmx`，线程数 3000、时长 60 秒，点 Run，看 Summary Report。
+
+**④ 校验**（跑完必做，不能省）
+
+```bash
+bin/verify.sh check <activityId> 500
+```
+
+**跳过屏障直接查 DB，成功数一定小于名额——那不是超卖，是消费者还没写完。** D5 整条约定就是为这个。
+
+**⑤ 归档**：把 QPS/P99/错误率/超卖数写进 `docs/benchmarks/YYYY-MM-DD-L<level>-<说明>.md`，含配置、原始结果、结论，并记录**压测机与应用机的资源分配**（前提 ⑤）。
+
+**GUI 与非 GUI 的数字不可混用。** GUI 线程要渲染每个采样结果，同样并发下 QPS 明显偏低、方差更大——手工课用 GUI 没问题，但 L0→L4 的对比表里要么全 GUI 要么全非 GUI，每份报告写明用了哪种。要出正式对比数字时，非 GUI 就是一条命令，不需要脚本：
+
+```bash
+jmeter -n -t jmeter/grab.jmx -Jthreads=3000 -Jduration=60 -Jcapacity=500 \
+  -l run.jtl -e -o docs/benchmarks/html-report
+```
 
 - [ ] **⛔ 停下来 + 第一次压测**
 
 ```bash
-bin/bench.sh l0 3000 60 500
+bin/verify.sh reset
+# IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
+bin/verify.sh check <activityId> 500
 ```
 Expected: `VERIFY PASSED`，`docs/benchmarks/2026-11-21-L0-基线.md` 生成。**这是整个项目的第一个数字，也是后面每一级要对比的基准。**
 
 - [ ] **Step 8: 提交**
 
 ```bash
-git add -A && git commit -m "feat: 压测脚手架（jmx + 预生成账号池 + bench/verify）"
+git add -A && git commit -m "feat: 压测脚手架（jmx + 预生成账号池 + verify 含屏障）"
 ```
 
 ---
@@ -482,7 +525,9 @@ return 1
 
 ```bash
 git add -A && git commit -m "feat: L1 Redis Lua 预扣 + 同步落库"
-bin/bench.sh l1 3000 60 500
+bin/verify.sh reset
+# IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
+bin/verify.sh check <activityId> 500
 ```
 Expected: `VERIFY PASSED`，报告里 QPS/P99 相对 L0 有可解释的变化。
 
@@ -609,7 +654,9 @@ class RegistrationEventConsumerTest {
 
 ```bash
 git add -A && git commit -m "feat: L2 RocketMQ 异步落库（幂等消费）"
-bin/bench.sh l2 3000 60 500
+bin/verify.sh reset
+# IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
+bin/verify.sh check <activityId> 500
 ```
 Expected: `VERIFY PASSED`（屏障消息保证消费者已追平，不是猜的），报告含 MQ 堆积与消费延迟。
 
@@ -719,7 +766,9 @@ git add -A && git commit -m "feat: 失败补偿链（MQ→同步→WAL→对账�
 
 ```bash
 git add -A && git commit -m "feat: 活动详情多级缓存（穿透/击穿/雪崩三件套）"
-bin/bench.sh l3 3000 60 500
+bin/verify.sh reset
+# IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
+bin/verify.sh check <activityId> 500
 ```
 `GET /api/activities/{id}` 的 QPS 应显著高于 L2。报告记录缓存命中率。
 
@@ -764,7 +813,9 @@ bin/bench.sh l3 3000 60 500
 
 ```bash
 git add -A && git commit -m "feat: 令牌桶限流与单用户滑动窗口频控"
-bin/bench.sh l4 3000 60 500
+bin/verify.sh reset
+# IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
+bin/verify.sh check <activityId> 500
 ```
 Expected: `VERIFY PASSED`。报告记录被限流比例与错误码分布——限流的意义不是拦住所有人，是超载时明确拒绝而不是拖垮服务。
 
@@ -782,12 +833,12 @@ Expected: `VERIFY PASSED`。报告记录被限流比例与错误码分布——�
 
 - [ ] **Step 2: 场景一 —— 压测中杀 Redis**
 
-`bin/bench.sh l2 3000 60 500`，第 20 秒 `bin/chaos/redis-kill.sh`，跑完 `bin/verify.sh`。
+GUI 跑 `jmeter/grab.jmx`（3000 线程 / 60 秒 / 500 名额），第 20 秒 `bin/chaos/redis-kill.sh`，跑完 `bin/verify.sh check <activityId> 500`。
 Expected: `VERIFY PASSED`——证明 D2 降级链路生效：Redis 挂了走 MySQL 条件更新，不多不少。记录 QPS 跌幅与错误码分布。
 
 - [ ] **Step 3: 场景二 —— 停 MQ 一段时间后恢复**
 
-第 15 秒 `mq-stop.sh`，第 35 秒 `mq-start.sh`。
+第 15 秒 `mq-stop.sh`，第 35 秒 `mq-start.sh`，跑完 `bin/verify.sh check <activityId> 500`。
 Expected: `VERIFY PASSED` 且对账最终补平（`reconcile_missing_in_db_total` 归零）——证明 D1「只补写」没丢单。
 
 - [ ] **Step 4: 场景三 —— MySQL 注入延迟**
@@ -846,18 +897,20 @@ git add -A && git commit -m "feat: 极简 Vue 前端（列表/详情/报名/取�
 
 ## 阶梯数据采集清单
 
-| 级别 | 命令 | 必记指标 |
+| 级别 | 流程（每级都是这三步，GUI 手动跑，见阶段 P Step 7） | 必记指标 |
 |---|---|---|
-| L0 | `bin/bench.sh l0 3000 60 500` | QPS / P99 / 错误率 / 超卖数=0（基线） |
-| L1 | `bin/bench.sh l1 3000 60 500` | 同上 + Redis 命中率 |
-| L2 | `bin/bench.sh l2 3000 60 500` | 同上 + MQ 堆积/消费延迟 |
-| L3 | `bin/bench.sh l3 3000 60 500` | 同上 + 缓存命中率 |
-| L4 | `bin/bench.sh l4 3000 60 500` | 同上 + 被限流比例、错误码分布 |
-| X | 三个故障场景 | 现象 + 结论 |
+| L0 | `verify.sh reset` → 跑 `grab.jmx` → `verify.sh check <aid> 500` | QPS / P99 / 错误率 / 超卖数=0（基线） |
+| L1 | 同上 | 同上 + Redis 命中率 |
+| L2 | 同上 | 同上 + MQ 堆积/消费延迟 |
+| L3 | 同上 | 同上 + 缓存命中率 |
+| L4 | 同上 | 同上 + 被限流比例、错误码分布 |
+| X | 三个故障场景（`redis-kill` / `mq-stop`+`mq-start` / 延迟注入） | 现象 + 结论 |
+
+参数固定为 3000 线程 / 60 秒 / 500 名额（D4），五级一致才能对比。
 
 ## 自检记录（writing-plans Self-Review）
 
-1. **Spec coverage**：7.1 链路 → L0/L1/L2；7.2 三层防线 → 阶段 0(schema/唯一索引)、L1(Lua)、L0(条件更新)；7.2 幂等 → L0/L1/L2；7.2 取消 → L1.5；7.2 失败补偿 → L2.5；7.3 削峰 → L2；7.3 缓存 → L3；7.3 限流 → L4；7.4 数据模型 → 阶段 0；7.5 阶梯 → 全部 + 采集清单；第 8 节证据链 → 阶段 P/X + 阶段 0 的指标；D1–D8 → L2.5(D1/D6)、阶段0+L1(D2)、阶段0(D3)、阶段P(D4/D5)、阶段0+P(D7)、阶段V(D8)。第 10 节 DoD → 阶段 P 的三条命令、阶段 X 的故障记录、阶段 0 的监控。
+1. **Spec coverage**：7.1 链路 → L0/L1/L2；7.2 三层防线 → 阶段 0(schema/唯一索引)、L1(Lua)、L0(条件更新)；7.2 幂等 → L0/L1/L2；7.2 取消 → L1.5；7.2 失败补偿 → L2.5；7.3 削峰 → L2；7.3 缓存 → L3；7.3 限流 → L4；7.4 数据模型 → 阶段 0；7.5 阶梯 → 全部 + 采集清单；第 8 节证据链 → 阶段 P/X + 阶段 0 的指标；D1–D8 → L2.5(D1/D6)、阶段0+L1(D2)、阶段0(D3)、阶段P(D4/D5)、阶段0+P(D7)、阶段V(D8)。第 10 节 DoD → 阶段 P 的 `bin/verify.sh`、阶段 X 的故障记录、阶段 0 的监控。
 2. **Step scan**：代码块只出现在「签名与测试无法确定」的地方（Lua 脚本、SQL schema、verify.sh 断言、测试断言），函数体一律不写。
 3. **Type consistency**：`RegistrationService.register(Long, Long) -> RegResult` 在 L0/L1/L1.5/L2 一致；`RegistrationScripts.grab(Long, Long, int) -> GrabCode` 在 L1/L1.5 一致；`ApiResponse<T>(int code, String msg, T data)` 在阶段 0 之后一致；`RedisKeys` 键名在所有阶段逐字相同。
 4. **Review Focus**：5 条各有归属（表内已列），另补 `capacity<=0`（阶段 0/L0）与压测机瓶颈（阶段 P）。
