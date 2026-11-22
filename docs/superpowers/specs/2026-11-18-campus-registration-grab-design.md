@@ -51,7 +51,8 @@
 | Redis | 8.0.5 | apt，`127.0.0.1:6379`，**AOF everysec + RDB 已开启**（`appendonlydir` 有 base.rdb + incr.aof），keyspace 干净，active + enabled |
 
 RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirectMemorySize=15g`，超出本机负荷，需以 `JAVA_OPT_EXT` 覆盖（namesrv 1g、broker 2g）。
-- 压测工具：JMeter 为主（Java 生态、脚本可版本化），必要时用 wrk 交叉验证。
+
+- 压测工具：JMeter 为主（Java 生态、脚本可版本化）。
 - 不在本阶段产生云主机等持续费用。
 
 ## 6. 考虑过的方案与取舍
