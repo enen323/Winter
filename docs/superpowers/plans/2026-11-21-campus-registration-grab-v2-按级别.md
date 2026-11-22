@@ -345,7 +345,7 @@ DBSTOCK=$(mysql -N -e "SELECT stock FROM activity WHERE id=$AID")
 
 - [ ] **Step 6: 证明 verify.sh 会失败**
 
-人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh check <activityId> <capacity>`。
+人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh check 1 <capacity>`。
 Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被证明会失败**，否则它的通过没有意义。
 
 - [ ] **Step 7: 不写 `bin/bench.sh` —— 压测由作者在 JMeter GUI 里手动跑（作者要求）**
@@ -358,6 +358,8 @@ Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被�
 bin/verify.sh reset
 ```
 
+`reset` 用 `TRUNCATE` 而不是 `DELETE` —— `DELETE` 不重置 `AUTO_INCREMENT`，第二轮活动就变成 id=2、第三轮 id=3，你得每轮改一次 `grab.jmx` 里的 activityId。`TRUNCATE registration` 再 `TRUNCATE activity`（先子表后父表，否则外键挡住），之后 **id 恒为 1**。
+
 **② 灌活动**（用 `seed-users.sh` 生成的任意一个 token；`startTime` 必须设成过去，否则同步定时器放行后全部返回 `NOT_STARTED`）
 
 ```bash
@@ -365,7 +367,7 @@ TOKEN=$(head -1 jmeter/tokens.csv | cut -d, -f2)
 curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"title":"L0 基线","capacity":500,"startTime":"2026-11-21T12:00:00"}'
-# 记下返回的 id，填进 jmeter/grab.jmx 的 activityId
+# 返回 id 应为 1（reset 已 TRUNCATE）；grab.jmx 里 activityId 填 1，之后每轮不用改
 ```
 
 **③ 跑压测**：GUI 打开 `jmeter/grab.jmx`，线程数 3000、时长 60 秒，点 Run，看 Summary Report。
@@ -373,7 +375,7 @@ curl -s -XPOST localhost:8080/api/activities -H "Authorization: Bearer $TOKEN" \
 **④ 校验**（跑完必做，不能省）
 
 ```bash
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 
 **跳过屏障直接查 DB，成功数一定小于名额——那不是超卖，是消费者还没写完。** D5 整条约定就是为这个。
@@ -392,7 +394,7 @@ jmeter -n -t jmeter/grab.jmx -Jthreads=3000 -Jduration=60 -Jcapacity=500 \
 ```bash
 bin/verify.sh reset
 # IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 Expected: `VERIFY PASSED`，`docs/benchmarks/2026-11-21-L0-基线.md` 生成。**这是整个项目的第一个数字，也是后面每一级要对比的基准。**
 
@@ -527,7 +529,7 @@ return 1
 git add -A && git commit -m "feat: L1 Redis Lua 预扣 + 同步落库"
 bin/verify.sh reset
 # IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 Expected: `VERIFY PASSED`，报告里 QPS/P99 相对 L0 有可解释的变化。
 
@@ -656,7 +658,7 @@ class RegistrationEventConsumerTest {
 git add -A && git commit -m "feat: L2 RocketMQ 异步落库（幂等消费）"
 bin/verify.sh reset
 # IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 Expected: `VERIFY PASSED`（屏障消息保证消费者已追平，不是猜的），报告含 MQ 堆积与消费延迟。
 
@@ -768,7 +770,7 @@ git add -A && git commit -m "feat: 失败补偿链（MQ→同步→WAL→对账�
 git add -A && git commit -m "feat: 活动详情多级缓存（穿透/击穿/雪崩三件套）"
 bin/verify.sh reset
 # IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 `GET /api/activities/{id}` 的 QPS 应显著高于 L2。报告记录缓存命中率。
 
@@ -815,7 +817,7 @@ bin/verify.sh check <activityId> 500
 git add -A && git commit -m "feat: 令牌桶限流与单用户滑动窗口频控"
 bin/verify.sh reset
 # IDEA 重启应用 → GUI 跑 jmeter/grab.jmx（3000 线程 / 60 秒 / 500 名额）
-bin/verify.sh check <activityId> 500
+bin/verify.sh check 1 500
 ```
 Expected: `VERIFY PASSED`。报告记录被限流比例与错误码分布——限流的意义不是拦住所有人，是超载时明确拒绝而不是拖垮服务。
 
@@ -833,12 +835,12 @@ Expected: `VERIFY PASSED`。报告记录被限流比例与错误码分布——�
 
 - [ ] **Step 2: 场景一 —— 压测中杀 Redis**
 
-GUI 跑 `jmeter/grab.jmx`（3000 线程 / 60 秒 / 500 名额），第 20 秒 `bin/chaos/redis-kill.sh`，跑完 `bin/verify.sh check <activityId> 500`。
+GUI 跑 `jmeter/grab.jmx`（3000 线程 / 60 秒 / 500 名额），第 20 秒 `bin/chaos/redis-kill.sh`，跑完 `bin/verify.sh check 1 500`。
 Expected: `VERIFY PASSED`——证明 D2 降级链路生效：Redis 挂了走 MySQL 条件更新，不多不少。记录 QPS 跌幅与错误码分布。
 
 - [ ] **Step 3: 场景二 —— 停 MQ 一段时间后恢复**
 
-第 15 秒 `mq-stop.sh`，第 35 秒 `mq-start.sh`，跑完 `bin/verify.sh check <activityId> 500`。
+第 15 秒 `mq-stop.sh`，第 35 秒 `mq-start.sh`，跑完 `bin/verify.sh check 1 500`。
 Expected: `VERIFY PASSED` 且对账最终补平（`reconcile_missing_in_db_total` 归零）——证明 D1「只补写」没丢单。
 
 - [ ] **Step 4: 场景三 —— MySQL 注入延迟**
@@ -899,7 +901,7 @@ git add -A && git commit -m "feat: 极简 Vue 前端（列表/详情/报名/取�
 
 | 级别 | 流程（每级都是这三步，GUI 手动跑，见阶段 P Step 7） | 必记指标 |
 |---|---|---|
-| L0 | `verify.sh reset` → 跑 `grab.jmx` → `verify.sh check <aid> 500` | QPS / P99 / 错误率 / 超卖数=0（基线） |
+| L0 | `verify.sh reset` → 跑 `grab.jmx` → `verify.sh check 1 500` | QPS / P99 / 错误率 / 超卖数=0（基线） |
 | L1 | 同上 | 同上 + Redis 命中率 |
 | L2 | 同上 | 同上 + MQ 堆积/消费延迟 |
 | L3 | 同上 | 同上 + 缓存命中率 |
