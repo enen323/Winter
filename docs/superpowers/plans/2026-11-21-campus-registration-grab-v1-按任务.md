@@ -1,5 +1,12 @@
 # 校园活动报名平台 —— 名额抢报 实施计划
 
+> **已废弃，勿照此执行。** 现行计划是 `2026-11-21-campus-registration-grab-v2-按级别.md`。
+> 本文件保留只为一处价值：v2 为压缩篇幅删掉的接口推导细节。相对 v2，本文件**已过时**的地方：
+> ① 报名链路开关从 `deduct`+`persist` 两个旋钮改成一个 `winter.registration.flow` 枚举
+> ② 按级别重组、每级有「停下来」闸门
+> ③ 不写 `bin/up.sh`，应用由 IDEA 启动
+> ④ 先写失败测试只保留在 `GrabScriptTest` 与 `JwtServiceTest` 两处
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现「活动名额抢报」核心链路，并产出可复现的阶梯压测证据（L0/L2/L4）与正确性校验，证明零超卖、零重复。
