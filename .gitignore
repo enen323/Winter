@@ -26,3 +26,6 @@ docs/benchmarks/html-report/
 # 工具/索引产物，不是项目代码
 .codegraph/
 .pi/
+
+# 压测账号池（1000+ 个 token，不是该进仓库的东西）
+jmeter/tokens.csv

@@ -16,6 +16,15 @@ spring:
     # 默认值只是为了 IDEA 直接跑得动；真上线前用环境变量 WINTER_DB_PASSWORD 覆盖，
     # 密码不要写死在这个会被提交到 GitHub 的文件里。
     password: ${WINTER_DB_PASSWORD:1234}
+    # 压测要的三处：
+    #   tomcat.threads.max   默认 200  → 3000 并发下请求堵在 accept 队列，测的是队列不是报名
+    #   hikari.maximum-pool-size 默认 10 → 3000 线程抢 10 个连接，connection-timeout(30s) 一到
+    #   就抛 SQLTransientConnectionException，那些 500 不是要测的东西
+    # 调大只为了让请求真正进到业务代码里，把排队从「Tomcat 队列/连接池」移到「行锁」上。
+    hikari:
+      maximum-pool-size: 50
+      minimum-idle: 10
+      connection-timeout: 30000
   # schema 由 Flyway 管。注意：MyBatis-Plus 不会像 JPA 的 ddl-auto=validate 那样
   # 启动时比对实体与表结构，列名写错要等运行到那条 SQL 才报错。
   flyway:
@@ -36,6 +45,14 @@ server:
   # ZooKeeper 与本项目无关（RocketMQ 5.x 用自己的 NameServer:9876，不走 ZK），
   # 所以不去动它，应用换个端口。
   port: 8081
+  tomcat:
+    # 默认 200，3000 并发时多出来的请求排队在 accept-count(默认 100) 里。
+    # 调到 4096 是为了让所有请求都进到业务代码，测的是报名链路不是队列。
+    threads:
+      max: 4096
+      min-spare: 64
+    # 默认 100；max-threads 满时往里塞的连接数，不够就拒连。
+    accept-count: 1000
 
 winter:
   jwt:
