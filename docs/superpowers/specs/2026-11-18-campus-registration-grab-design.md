@@ -166,7 +166,39 @@ RocketMQ 的 namesrv/broker 启动脚本默认申请 `-Xms8g -Xmx8g` + `MaxDirec
 
 **D6 发送消息失败的处理：**降级为同步落库；同步落库也失败则写本地文件 WAL 后台重放，对账任务最后兜底。理由：内存队列在进程崩溃时丢单，而这里丢的是“用户已被告知成功”的单。
 
-**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。**隔离级别保持默认 REPEATABLE-READ，不做调整**（作者决定）。理由：主流高并发教程与生产实践多沿用默认值，且本场景的库存更新走主键唯一查找（`WHERE id = ? AND stock > 0`），只产生行锁、不触发间隙锁，死锁概率不高。附带约定：压测数据中必须统计 deadlock 次数（`ERROR 1213 (40001): Deadlock found when trying to get lock`），若在 L1/L2 阶梯出现，修复手段只是在 JDBC URL 加 `sessionVariables=transaction_isolation='READ-COMMITTED'`（一行、可逆、不动全局配置，不波及本机其他项目的库）。
+**D7 MySQL 参数与隔离级别**：`innodb_buffer_pool_size` 当前 128MB、`max_connections` 151，均偏小，调参作为阶梯中的独立一步并记录前后对比（MySQL 8 支持 `SET GLOBAL` 在线调整，无需重启）。**隔离级别保持默认 REPEATABLE-READ，不做调整**（作者决定）。
+
+> **L0 实测修正（2026-11-23，此条原判被实验推翻）**：原判「隔离级别保持默认即可，且若死锁只需在 JDBC URL 加 `transactionIsolation='READ-COMMITTED'`」中，前半句成立、后半句**被证伪**。实测 400 线程并发报名（100 名额）稳定复现 `ERROR 1213 (40001): Deadlock found when trying to get lock`，`SHOW ENGINE INNODB STATUS` 显示两个事务都持有 `RECORD LOCKS ... lock mode S locks rec but not gap` 并互等 `lock_mode X`。
+>
+> **真实原因（2026-11-23 二次修正，第一次的解释也是错的）**：S 锁**不是 UPDATE 加的，是 INSERT 的外键检查加的**。`registration` 上有外键 `fk_reg_activity` 指向 `activity`，往 registration 插一行时，InnoDB 必须给 activity 那一行加 S 锁校验外键。`performance_schema.data_locks` 实测（UPDATE 尚未执行时该锁已存在）：
+>
+> ```text
+> activity     PRIMARY   RECORD   S,REC_NOT_GAP   GRANTED
+> registration null      TABLE    IX              GRANTED
+> ```
+>
+> 同事务接下来的 `UPDATE activity` 要把这行从 S 升级成 X，两个事务同时持 S 等 X 即成环。
+>
+> **第一版解释（「谓词里有非索引列 `stock`，InnoDB 必须先加 S 读行再升级」）被自己的数据反驳**：把 `AND stock > 0` 整个去掉，死锁从 129 涨到 137（/200），谓词根本不是原因。决定性的一组对照：
+>
+> | 事务内容（10 线程 × 20 轮 = 200 个写事务，每轮一个全新用户） | 死锁 | 成功 |
+> | --- | --- | --- |
+> | 只有 UPDATE，没有 INSERT | **0** | — |
+> | **`tryConfirm(INSERT)` → `decrement(UPDATE)`**（即「去掉 FOR UPDATE」） | **173** | 27 |
+> | INSERT → `FOR UPDATE` → UPDATE | 146 | — |
+> | **`FOR UPDATE` → `tryConfirm` → `decrement`** | **0** | 200 |
+>
+> 第一行是诊断：没有 INSERT 就没有外键检查、没有 S 锁，死锁归零。第二行就是「不要 FOR UPDATE」的后果——173/200 死锁，只有 27 个事务活下来，跑两遍结果一致（173/27 与 174/26）。最后一行 200/200 成功，且 `COUNT(DISTINCT user_id) = 200`、`stock` 从 1000 减到 800，正确性也一并验证。
+>
+> 与隔离级别无关——把 JDBC URL 设成 READ-COMMITTED 后，第一行形状实测仍死锁 129/200。
+>
+> **真实处方**：把 `SELECT stock FROM activity WHERE id = ? FOR UPDATE` 放在事务的**第一条**。FOR UPDATE 直接拿 X，之后外键检查发现本事务已持 X（自己兼容自己），全程没有升级。最后一行在默认 REPEATABLE-READ 下同样是 0，因此**不必改隔离级别**——D7 的决定得以保留，只是保留的理由从「死锁概率不高」换成「死锁的成因是加锁顺序，不是隔离级别」。
+>
+> 附带一条同源观察：外键 `fk_reg_activity` 本身就是死锁放大器，只要「往 registration 插行」和「改 activity」在同一事务里就会争这把锁。本项目保留该外键（它保证不会出现指向不存在活动的报名记录），用 `FOR UPDATE` 前置化解；L1/L2 把写路径挪到 MQ 消费者后，这个争抢自然消失，但 D2 的降级路径长期保留这个形状，所以锁顺序必须钉在代码里。
+>
+> 保留的约定：压测数据中仍须统计 deadlock 次数（`ERROR 1213`），用于确认后续阶梯没有把这个问题引回来。
+>
+> 实现位置：`backend/src/main/java/com/winter/reg/mapper/ActivityMapper.java` 的 `lockActivityRow`，由 `backend/src/main/java/com/winter/reg/service/SyncWriter.java` 的 `write()` 第一条调用。
 
 **D8 前端形态：极简 Vue 页面（作者拍板）。** 不做 Thymeleaf 服务端渲染。理由：前端在本项目只承担「能点、能看结果」（报名成功/失败、我的报名列表），压测不依赖前端（见第 3 节非目标）；前后端分离还能让报名接口独立压测、不被页面渲染干扰。D1 已明确前端可直接展示返回值，因此不需要轮询接口。
 

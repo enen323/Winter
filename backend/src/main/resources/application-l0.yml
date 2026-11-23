@@ -1,0 +1,8 @@
+# L0：报名链路走 MySQL 条件更新，不碰 Redis。
+# 只放这一行——其余配置（数据源、Redis、端口、JWT）都由 application.yml 提供。
+# 用 IDEA 或 `java -jar ... --spring.profiles.active=l0` 启动；不指定 profile 时
+# RegistrationConfig 三个条件全不命中，启动会报「No qualifying bean of type 'RegistrationService'」，
+# 这是刻意设计的失败方式，防止在错误的级别上跑压测。
+winter:
+  registration:
+    flow: L0

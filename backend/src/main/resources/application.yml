@@ -1,10 +1,21 @@
 spring:
   datasource:
-    url: jdbc:mysql://127.0.0.1:3306/winter?serverTimezone=Asia/Shanghai&characterEncoding=utf8&useUnicode=true
-    username: winter
+    # useAffectedRows=true 是刻意钉死的，改之前先看 DbRegistrationServiceTest：
+    #
+    # Connector/J 默认是 false，语义是「匹配到的行数」，于是 INSERT ... ON DUPLICATE KEY UPDATE id=id
+    # 命中重复时返回 1 而不是 0，RegistrationMapper.tryConfirm 的去重会静默失效。
+    # 实测（mysql-connector-j 8.3.0，用 JDBC 探针分别测三种 URL）：
+    #   默认 / useAffectedRows=false → 重复插入返回 1
+    #   useAffectedRows=true          → 重复插入返回 0   ← 要的是这个
+    # 而 mysql 客户端的 ROW_COUNT() 两种情况都是 0，所以这个坑只在 JDBC 层出现。
+    #
+    # 隔离级别刻意保持默认 REPEATABLE-READ（D7）：并发死锁不是隔离级别造成的，
+    # 实测加 transactionIsolation=READ-COMMITTED 后 UPDATE 仍死锁 129/200 轮。
+    url: jdbc:mysql://127.0.0.1:3306/winter?serverTimezone=Asia/Shanghai&characterEncoding=utf8&useUnicode=true&useAffectedRows=true
+    username: root
     # 默认值只是为了 IDEA 直接跑得动；真上线前用环境变量 WINTER_DB_PASSWORD 覆盖，
     # 密码不要写死在这个会被提交到 GitHub 的文件里。
-    password: ${WINTER_DB_PASSWORD:winter}
+    password: ${WINTER_DB_PASSWORD:1234}
   # schema 由 Flyway 管。注意：MyBatis-Plus 不会像 JPA 的 ddl-auto=validate 那样
   # 启动时比对实体与表结构，列名写错要等运行到那条 SQL 才报错。
   flyway:

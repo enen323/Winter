@@ -17,3 +17,12 @@ docs/benchmarks/html-report/
 .idea/
 *.iml
 .vscode/
+
+# pi-lens 触发 Java LSP 时生成的 Eclipse 工程文件（LSP 需要，但不属于项目代码）
+.project
+.classpath
+.settings/
+
+# 工具/索引产物，不是项目代码
+.codegraph/
+.pi/

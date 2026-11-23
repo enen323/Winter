@@ -22,7 +22,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 @Component
 public class JwtAuthFilter extends OncePerRequestFilter {
 
-  static final String ATTR_USER_ID = "userId";
+  /** request attribute 名，控制器用 {@code @RequestAttribute(JwtAuthFilter.ATTR_USER_ID)} 取。 */
+  public static final String ATTR_USER_ID = "userId";
 
   private final JwtService jwtService;
   private final ObjectMapper json = new ObjectMapper();

@@ -11,7 +11,9 @@ public enum ResultCode {
   RATE_LIMITED(1006, "请求过于频繁"),
   DEGRADED(1007, "服务降级中，请稍后重试"),
   UNAUTHORIZED(1400, "未登录或登录已过期"),
-  PARAM_ERROR(1500, "参数错误");
+  PARAM_ERROR(1500, "参数错误"),
+  /** 服务端自己出了问题，与调用方无关。HTTP 500，堆栈只进日志。 */
+  INTERNAL_ERROR(1600, "internal error");
 
   private final int code;
   private final String msg;

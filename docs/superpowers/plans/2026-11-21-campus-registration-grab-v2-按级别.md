@@ -29,6 +29,75 @@
 - 本阶段不做：SSO、支付、通知、签到核销、主办方审核、抽签摇号、微服务/K8s/分库分表。
 - **每一级必须单独跑一次完整压测 + verify**，不能只跑最终架构再反推中间数字（设计文档反目标：优化痕迹丢失）。
 
+### 报名链路的代码结构约定（L0 动手前定，5 条）
+
+前 3 条原本已散在 L0/L1 段里，此处集中确认；后 2 条原计划写得含糊，现在定死。
+
+**① Lua 脚本是 classpath 文件，不是 Java 字符串常量。**
+`backend/src/main/resources/lua/grab.lua`，由 `RegistrationScripts` 用 `@Value("classpath:lua/grab.lua")` 注入文本并构造 `DefaultRedisScript<Long>`。理由：`GrabScriptTest` 必须加载**同一份**文件——写成字符串常量的话测试只能复制一份，两份必然漂移，而这份脚本就是三层防线的第一层。
+
+**② `flow` 开关用 `@ConditionalOnProperty` 选 bean，不用 if-else 工厂。**
+
+```java
+@Configuration
+class RegistrationConfig {
+  @Bean @ConditionalOnProperty(name = "winter.registration.flow", havingValue = "L0")
+  RegistrationService dbRegistrationService(SyncWriter w, RegMetrics m) { return new DbRegistrationService(w, m); }
+
+  @Bean @ConditionalOnProperty(name = "winter.registration.flow", havingValue = "L1")
+  RegistrationService luaSyncRegistrationService(RegistrationScripts s, SyncWriter w, RegMetrics m) {
+    return new LuaSyncRegistrationService(s, w, m);
+  }
+
+  @Bean @ConditionalOnProperty(name = "winter.registration.flow", havingValue = "L2")
+  RegistrationService luaAsyncRegistrationService(RegistrationScripts s, RegistrationPublisher p, SyncWriter w, RegMetrics m) {
+    return new LuaAsyncRegistrationService(s, p, w, m);
+  }
+}
+```
+
+**不要加 `matchIfMissing = true`**：值写错（如 `l0` 小写）时三个条件全不命中，启动直接失败并报 `No qualifying bean of type 'RegistrationService'`——这是想要的失败方式。给了默认值会把打错的值静默变成 L0，在错误的级别上跑完一轮压测。
+
+**③ service 分层：接口 + 实现同在 `service/`，控制器只依赖接口。**
+`RegistrationService` / `CancelService` 是接口，`DbRegistrationService` 是 D2 定的长期降级链路（Redis 故障时回落到它），**不因为上了 L1/L2 就删**。控制器 `@Autowired RegistrationService`，不需要知道当前是哪一级。
+
+**④ `RegMetrics` 是 `@Component`，构造注入，Counter 用 `public final` 字段直接暴露。**
+
+```java
+@Component
+public class RegMetrics {
+  public final Counter success;      // registration_success_total
+  public final Counter full;         // registration_full_total
+  public final Counter already;      // registration_already_total
+  // … 共 9 个，命名照计划 L2.5 指标清单
+
+  public RegMetrics(MeterRegistry registry) {
+    success = Counter.builder("registration_success_total").register(registry);
+    full = Counter.builder("registration_full_total").register(registry);
+    // …
+  }
+}
+```
+
+不给每个计数器包一个 `incrementSuccess()` 方法——service 里写 `metrics.success.increment()` 一样清楚，少 9 个方法。不在 service 里 `new RegMetrics()`，否则测试断言不了计数器。
+
+**⑤ L1 与 L2 是两个类，不是一个类按 `flow` 内部分支。**
+`LuaSyncRegistrationService`（L1：grab 成功即同步落库）与 `LuaAsyncRegistrationService`（L2：grab 成功即发 MQ，发失败降级同步落库，再失败写 WAL）。原计划写的 `LuaRegistrationService`「按 flow 落库」作废——`flow` 已经在 bean 选择时消费掉了，方法里再判一次就是把两个合法值变成一个类的两个隐藏模式，压测数据说不清是哪条路径。
+
+两者共用 package-private 的 `SyncWriter`，**下单顺序只在一处**：
+
+```java
+class SyncWriter {                                   // 不加 @Component，由三个 service 各自 new 或注入
+  boolean write(Long activityId, Long userId) {      // false = 名额已尽
+    if (registrationMapper.tryConfirm(activityId, userId) == 0) return true;   // 行已存在，ALREADY
+    return activityMapper.decrementStockIfPositive(activityId) > 0;
+  }
+  void reuseRow(Long activityId, Long userId) { /* L1.5 取消后重新报名 */ }
+}
+```
+
+顺序是**先 `tryConfirm` 后 `decrementStockIfPositive`**（L0 Step 3 的理由）：反过来的话，唯一索引命中时会先吞掉一个名额再发现重复，名额白白少一个。这段顺序在 L0/L1/L2 三处必须逐字相同，所以抽出来——D2 要求降级路径与正常路径行为一致，复制三份必然有一份先改错。
+
 ## Review Focus
 
 设计文档是愿景文档。以下五类输入最可能坑到使用者，每条的测试挂在所属阶段里：
@@ -250,14 +319,19 @@ curl -s localhost:8081/api/activities
 | 重复用户名 | `code=1500` "用户名已被占用" |
 | 错误密码 / 不存在的用户 | 都返回 `code=1500` "用户名或密码错误"（**同一条消息，不泄漏用户是否存在**） |
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**（作者授权后执行）
+
+实际提交了三个，因为底座写完后又修了端口、换了持久层：
 
 ```bash
-git -c user.name=peekball -c user.email=peekball@local add -A \
-  && git -c user.name=peekball -c user.email=peekball@local commit -m "feat: 底座（Schema、JWT、活动 CRUD）"
+df1d9dd feat: 底座（Schema、JWT、活动 CRUD）
+c90fd5b fix: 应用端口 8080 改 8081，避开本机 ZooKeeper AdminServer
+b5f91bc refactor: 持久层从 JPA/Hibernate 换到 MyBatis-Plus 3.5.18.1
 ```
 
 **提交必须带 `-c user.name=peekball -c user.email=peekball@local`**：仓库没有配置 git 身份，直接 commit 会报 `fatal: 无法自动探测邮件地址（得到 'peekball@HP.(none)'）`。
+
+> **闸门违约见「执行节奏」**：`df1d9dd` 是 AI 未等作者跑就提交的，后两个由作者明确授权后才提交。
 
 ---
 
@@ -268,6 +342,9 @@ git -c user.name=peekball -c user.email=peekball@local add -A \
 - Create: `backend/src/main/java/com/winter/reg/service/RegistrationService.java`
 - Create: `backend/src/main/java/com/winter/reg/service/DbRegistrationService.java`
 - Create: `backend/src/main/java/com/winter/reg/service/StockExhaustedException.java`
+- Create: `backend/src/main/java/com/winter/reg/service/SyncWriter.java`
+- Create: `backend/src/main/java/com/winter/reg/service/RegistrationConfig.java`
+- Create: `backend/src/main/java/com/winter/reg/metrics/RegMetrics.java`
 - Create: `backend/src/main/java/com/winter/reg/web/RegistrationController.java`
 - Create: `backend/src/main/resources/application-l0.yml`
 - Modify: `backend/src/main/java/com/winter/reg/mapper/{ActivityMapper,RegistrationMapper}.java`
@@ -281,11 +358,13 @@ git -c user.name=peekball -c user.email=peekball@local add -A \
   - `enum RegResult { SUCCESS, FULL, ALREADY, NOT_STARTED, CLOSED, NOT_FOUND, RATE_LIMITED, DEGRADED }`
   - `RegistrationMapper.tryConfirm(Long activityId, Long userId) -> int` —— `INSERT ... ON DUPLICATE KEY UPDATE id=id`，返回 0 表示已存在
   - `ActivityMapper.decrementStockIfPositive(Long id) -> int` —— `UPDATE activity SET stock=stock-1 WHERE id=? AND stock>0`
-  - `RegistrationMapper.selectByActivityIdAndUserId(Long, Long) -> Registration`
+  - `ActivityMapper.lockActivityRow(Long id) -> Integer` —— `SELECT stock FROM activity WHERE id=? FOR UPDATE`，**死锁的关键，见 Step 2**
+  - `SyncWriter.write(Long activityId, Long userId) -> RegResult` —— 独立 bean，`@Transactional`，L1/L2 复用
   - `POST /api/registrations/{activityId}`（需登录，userId 取自 token，**不接收 body 里的 userId**）
   - `application-l0.yml`：`winter.registration.flow=L0`
+  - 推迟到 L1.5：`RegistrationMapper.selectByActivityIdAndUserId(Long, Long)` —— L0 无人调用，建了是死代码
 
-- [ ] **Step 1: 先写失败的测试 `DbRegistrationServiceTest`**
+- [x] **Step 1: 先写失败的测试 `DbRegistrationServiceTest`**
 
 ```java
 @SpringBootTest @ActiveProfiles("l0")
@@ -323,33 +402,85 @@ class DbRegistrationServiceTest {
         pool.shutdown();
         assertThat(success).isEqualTo(100);                                    // 恰好 100，不是 <=100
         assertThat(activityMapper.selectById(aid).getStock()).isEqualTo(0);
-        assertThat(registrationMapper.selectCount(null)).isEqualTo(100);             // 无重复行
+        assertThat(registrationMapper.selectCount(
+                new LambdaQueryWrapper<Registration>().eq(Registration::getActivityId, aid))).isEqualTo(100);  // 无重复行
     }
 }
 ```
+
+> **计划原文两处已修正**：① `selectCount(null)` 没按 activityId 限定，4 个测试各自 seed 会把计数喂饱，必须加 `LambdaQueryWrapper` 限定；② 缺 `@AfterEach` 清理，要**先删 registration 后删 activity**（外键顺序）。
+>
+> **另一处必须补的坑**：`@Transactional` 默认只给 public 方法织事务（`AnnotationTransactionAttributeSource.publicMethodsOnly=true`），
+> package-private 的 `SyncWriter` + package-private `write()` 会被**静默跳过**，事务失效、回滚没了，测试却未必发现。
 
 Run: `mvn test -Dtest=DbRegistrationServiceTest` → 先 FAIL，实现后 PASS。
 
 **断言写 `== 100` 而不是 `<= 100` 是这个测试的全部价值**：`<=` 会把「名额被吞」也算成通过。
 
-- [ ] **Step 2: 实现 `DbRegistrationService`**
+- [x] **Step 2: 实现 `DbRegistrationService`**
 
-方法标注 `@Transactional`。顺序是**先插记录、后扣库存**：
+写在独立的 `SyncWriter` bean 里，不是 `DbRegistrationService` 的私有方法——`@Transactional` 靠 Spring AOP 代理生效，同类内自调用不走代理。L1/L2 复用它，所以「下单顺序」整个项目只有这一处。
+
+顺序是**先插记录、后扣库存**：
 
 1. `tryConfirm` 靠唯一索引挡住重复（返回 0 → `ALREADY`，此时还没扣库存）
 2. `decrementStockIfPositive` 返回 0 说明库存空了 → 抛 `StockExhaustedException` 让事务回滚，已插入的那行随之消失
 
-反过来（先扣后插）在唯一索引命中时会少扣库存——不卖超但会「吞名额」，是本项目最阴的一类 bug。`GlobalExceptionHandler` 把 `StockExhaustedException` 映射为 `ApiResponse.fail(ResultCode.FULL)`。
+反过来（先扣后插）在唯一索引命中时会少扣库存——不卖超但会「吞名额」，是本项目最阴的一类 bug。`StockExhaustedException` 在 `DbRegistrationService` 里被 catch 成 `RegResult.FULL`，**永远不会逃到 `GlobalExceptionHandler`**，所以不需要给它加映射。
 
-- [ ] **⛔ 停下来：作者亲手跑**
+#### ⚠️ 三条实现期才发现的坑（都已在代码里注释）
+
+**① 事务第一条必须是 `SELECT ... FOR UPDATE`，否则死锁。**
+
+S 锁**不是 UPDATE 加的，是 INSERT 的外键检查加的**——`registration` 有外键 `fk_reg_activity` 指向 `activity`，往 registration 插一行时 InnoDB 必须给 activity 那行加 S 锁校验外键（`performance_schema.data_locks` 实测，UPDATE 还没跑这锁就已挂着）。同事务的 UPDATE 要把它升级成 X，两个事务同时持 S 等 X 即成环。400 线程并发报名稳定复现 `ERROR 1213`。
+
+| 事务内容（10 线程 × 20 轮 = 200 个写事务，每轮一个全新用户） | 死锁 | 成功 |
+| --- | --- | --- |
+| 只有 UPDATE，没有 INSERT | **0** | — |
+| **`tryConfirm(INSERT)` → `decrement(UPDATE)`**（即「去掉 FOR UPDATE」） | **173** | 27 |
+| INSERT → `FOR UPDATE` → UPDATE | 146 | — |
+| **`FOR UPDATE` → `tryConfirm` → `decrement`** | **0** | 200 |
+
+第一行是诊断：没有 INSERT 就没有外键检查、没有 S 锁，死锁归零。第二行就是「不要 FOR UPDATE」的后果——173/200 死锁，只有 27 个事务活下来，跑两遍结果一致（173/27 与 174/26）。最后一行 200/200 成功，且 `COUNT(DISTINCT user_id) = 200`、`stock` 从 1000 减到 800，正确性一并验证。
+
+复现方式：`/tmp/probe2/Probe.java`（JDBC 直连，SQL 与 mapper 字面一致，URL 带 `useAffectedRows=true`）。
+
+**改隔离级别无效**——把 JDBC URL 设成 READ-COMMITTED 后，第一行形状实测仍死锁 129/200。设计文档 D7 原来的处方被这条推翻，已按实测改写（D7「不改隔离级别」的决定本身保留，只是理由换了）。
+
+**② `useAffectedRows=true` 必须显式写在 JDBC URL 里。**
+
+Connector/J 默认 `false`，语义是「匹配到的行数」，于是 `INSERT ... ON DUPLICATE KEY UPDATE id=id` 命中重复时返回 **1** 而不是 0，`tryConfirm` 的去重会静默失效——测试表现为「同用户第二次报名也成功」。实测：`false`→1、`true`→0；而 mysql 客户端的 `ROW_COUNT()` 两种情况都是 0，所以这个坑用 CLI 测不出来。
+
+**③ `RegMetrics` 只建 L0 用得到的 5 个**（success/full/already/not_started/closed），另 4 个（rate_limited/reconcile_missing_in_db/wal_replayed/mq_dead_lettered）等 L4 和 L2.5。
+
+- [x] **⛔ 停下来：作者亲手跑**
 
 用 curl 打报名接口，逐个确认五种返回的中文提示：`报名成功` / `已满`（把 capacity 建成 1，连打两次）/ `已报名`（同 token 再打）/ `未开始`（建一个未来时间的活动）/ `活动不存在`。**重点看「已满」**——这是 L0 唯一能证明「条件更新兜底」生效的路径。
+
+起法：`java -jar backend/target/winter-reg-0.1.0-SNAPSHOT.jar --spring.profiles.active=l0`
+
+> `startTime` 必须是 ISO 格式带 `T`（`2026-11-23T17:00:00`）。写成空格分隔的会拿到 `code=1500 请求体格式错误`——这是 `HttpMessageNotReadableException` 的映射，不是服务端故障。
+
+**AI 已验证的记录（2026-11-23，`mvn test` 9/9 + curl 实测）**：
+
+| 场景 | 返回 | DB 终态 |
+| --- | --- | --- |
+| 成功报名（500 名额） | `code=0 ok` | stock 500→499，1 行 CONFIRMED |
+| 重复报名 | `code=1002 已报名过该活动` | 无新行 |
+| 名额已满（1 名额，第二个用户） | `code=1001 名额已满` | stock=0，**只 1 行** |
+| 未到开抢 | `code=1003 未到开抢时间` | stock 未动、无行 |
+| 活动不存在 | `code=1005 不存在` | — |
+| 未登录 | `code=1400 未登录或登录已过期` | — |
+
+`DbRegistrationServiceTest.concurrentRegister_noOversell_noDuplicate`（400 线程 / 100 名额）：**0 死锁、success=100、stock=0、无重复行**。
 
 - [ ] **Step 3: 提交**
 
 ```bash
-git add -A && git commit -m "feat: L0 报名链路（MySQL 条件更新，含并发零超卖测试）"
+git add -A && git -c user.name=peekball -c user.email=peekball@local commit -m "feat: L0 报名链路（MySQL 条件更新，含并发零超卖测试）"
 ```
+
+**闸门**：作者亲手跑过之前不许 commit，也不许 `git add` 后提示「可以提交了」。AI 跑通只代表「代码能运行」。
 
 ---
 
@@ -497,11 +628,12 @@ git add -A && git commit -m "feat: 压测脚手架（jmx + 预生成账号池 + 
 - Create: `backend/src/main/resources/lua/{grab,cancel}.lua`
 - Create: `backend/src/main/java/com/winter/reg/config/RedisConfig.java`
 - Create: `backend/src/main/java/com/winter/reg/lua/{RegistrationScripts,RedisKeys}.java`
-- Create: `backend/src/main/java/com/winter/reg/service/LuaRegistrationService.java`
+- Create: `backend/src/main/java/com/winter/reg/service/LuaSyncRegistrationService.java`
+- Create: `backend/src/main/java/com/winter/reg/service/SyncWriter.java`
 - Create: `backend/src/main/resources/application-l1.yml`
 - Modify: `backend/src/main/java/com/winter/reg/service/ActivityService.java`
 - Test: `backend/src/test/java/com/winter/reg/lua/GrabScriptTest.java`
-- Test: `backend/src/test/java/com/winter/reg/service/LuaRegistrationServiceTest.java`
+- Test: `backend/src/test/java/com/winter/reg/service/LuaSyncRegistrationServiceTest.java`
 
 **Interfaces:**
 
@@ -585,15 +717,15 @@ return 1
 
 **这是计划相对设计文档 7.1 的唯一细化**：时间/状态校验并入 Lua（读 `activity:{aid}` 快照），一次 Redis 往返完成，同时消除「校验通过」到「扣减」之间的 TOCTOU 窗口。不改变任何设计决定。
 
-- [ ] **Step 3: 实现 `RegistrationScripts`、`RedisConfig`、`LuaRegistrationService`**
+- [ ] **Step 3: 实现 `RegistrationScripts`、`RedisConfig`、`LuaSyncRegistrationService`、`SyncWriter`**
 
 `RegistrationScripts` 用 `@Value("classpath:lua/grab.lua")` 注入脚本文本，构造 `DefaultRedisScript<Long>`，`redisTemplate.execute(script, keys, args)` 调用。`RedisConfig` 配 Lettuce（`127.0.0.1:6379`）与 `StringRedisTemplate`。
 
-`LuaRegistrationService.register`：`scripts.grab(...)` 的 `FULL`/`ALREADY`/`NOT_STARTED`/`CLOSED` 直接映射为对应 `RegResult`；`SUCCESS` 则按 `flow` 落库（L1 只有同步一支）。**同步落库失败不得撤销 Redis**（D1）：记 `reconcile_missing_in_db_total` 计数器 + ERROR 日志，交给 L2.5 的对账补写。`RedisException` 时降级到 `DbRegistrationService`（D2 的长期降级链路，由代码 catch 实现，不是配置开关）。
+`LuaSyncRegistrationService.register`：`scripts.grab(...)` 的 `FULL`/`ALREADY`/`NOT_STARTED`/`CLOSED` 直接映射为对应 `RegResult`；`SUCCESS` 则调 `SyncWriter.write(...)` 同步落库。**同步落库失败不得撤销 Redis**（D1）：记 `reconcile_missing_in_db_total` 计数器 + ERROR 日志，交给 L2.5 的对账补写。`RedisException` 时降级到 `DbRegistrationService`（D2 的长期降级链路，由代码 catch 实现，不是配置开关）。
 
-`flow` 用一个枚举而非 `deduct`+`persist` 两个布尔/枚举：`flow=L0`→`DbRegistrationService`；`flow=L1`→`LuaRegistrationService`（同步）；`flow=L2`→`LuaRegistrationService`（MQ）。两个独立旋钮能组合出 `deduct=DB, persist=MQ` 这种无意义状态。
+`flow` 用一个枚举而非 `deduct`+`persist` 两个布尔/枚举：`flow=L0`→`DbRegistrationService`；`flow=L1`→`LuaSyncRegistrationService`；`flow=L2`→`LuaAsyncRegistrationService`。两个独立旋钮能组合出 `deduct=DB, persist=MQ` 这种无意义状态。** bean 选择用 `@ConditionalOnProperty`，见 Global Constraints「报名链路的代码结构约定」②。**
 
-- [ ] **Step 4: 先写失败的 `LuaRegistrationServiceTest`，再补齐**
+- [ ] **Step 4: 先写失败的 `LuaSyncRegistrationServiceTest`，再补齐**
 
 在 L0 用例基础上改两处断言，并发用例结构照抄 L0：
 
@@ -684,7 +816,7 @@ redis.call('DEL', KEYS[3])
 return 1
 ```
 
-`CancelService.cancel` 调 `cancel.lua`，`SUCCESS` 则同步把 DB 记录置 `CANCELED` + `stock+1`（L1 阶段没有 MQ，直接同步）。`LuaRegistrationService` 的落库分支**不能直接用 `INSERT`**：先试 `reuseRow`（更新已存在的 CANCELED 行），返回 0 再 `tryConfirm`。
+`CancelService.cancel` 调 `cancel.lua`，`SUCCESS` 则同步把 DB 记录置 `CANCELED` + `stock+1`（L1 阶段没有 MQ，直接同步）。`SyncWriter` 的写分支**不能直接用 `INSERT`**：先试 `reuseRow`（更新已存在的 CANCELED 行），返回 0 再 `tryConfirm`。
 
 - [ ] **⛔ 停下来：作者亲手跑**
 
@@ -704,7 +836,7 @@ git add -A && git commit -m "feat: 取消报名与名额回池（复用同一行
 
 - Create: `backend/src/main/java/com/winter/reg/mq/{RegistrationEventPublisher,RegistrationEventConsumer,BarrierProducer,MqConfig}.java`
 - Create: `backend/src/main/resources/application-l2.yml`
-- Modify: `backend/src/main/java/com/winter/reg/service/LuaRegistrationService.java`
+- Modify: `backend/src/main/java/com/winter/reg/service/LuaAsyncRegistrationService.java`
 - Modify: `backend/src/main/java/com/winter/reg/mq/RegistrationEventConsumer.java`（`CANCEL` 分支）
 - Test: `backend/src/test/java/com/winter/reg/mq/RegistrationEventConsumerTest.java`
 
@@ -802,7 +934,7 @@ class ReconciliationServiceTest {
 
 - [ ] **Step 2: 实现补偿链**
 
-按 D6 顺序接到 `LuaRegistrationService` 的 L2 分支：`publisher.publish(...)` 返回 false → 立刻同步落库；同步落库也抛异常 → `WalWriter.append(event)`。`WalReplayer` 定时（30 秒）重放，成功补写即打 `wal_replayed_total`。
+按 D6 顺序接到 `LuaAsyncRegistrationService`：`publisher.publish(...)` 返回 false → 立刻同步落库；同步落库也抛异常 → `WalWriter.append(event)`。`WalReplayer` 定时（30 秒）重放，成功补写即打 `wal_replayed_total`。
 
 `ReconciliationService.reconcile` 用 `SMEMBERS enrolled:{aid}` 与 `SELECT user_id FROM registration WHERE activity_id=? AND status='CONFIRMED'` 做集合差：`inRedisNotInDb` 的**补写**，`inDbNotInRedis` 的**只告警不删 DB 记录**（D1：不得删除记录）。定时执行（60 秒），差异写进 `reconcile_missing_in_db_total` 与 ERROR 日志。
 
