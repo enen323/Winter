@@ -474,13 +474,7 @@ Connector/J 默认 `false`，语义是「匹配到的行数」，于是 `INSERT 
 
 `DbRegistrationServiceTest.concurrentRegister_noOversell_noDuplicate`（400 线程 / 100 名额）：**0 死锁、success=100、stock=0、无重复行**。
 
-- [ ] **Step 3: 提交**
-
-```bash
-git add -A && git -c user.name=peekball -c user.email=peekball@local commit -m "feat: L0 报名链路（MySQL 条件更新，含并发零超卖测试）"
-```
-
-**闸门**：作者亲手跑过之前不许 commit，也不许 `git add` 后提示「可以提交了」。AI 跑通只代表「代码能运行」。
+- [x] **Step 3: 提交**（commit `aeab079`；闸门已过——作者亲手跑过报名接口，确认「同一个用户无法报名两次」符合预期）
 
 ---
 
@@ -503,11 +497,11 @@ git add -A && git -c user.name=peekball -c user.email=peekball@local commit -m "
   - `POST /api/admin/barrier` → 发屏障消息返回 `runId`；消费者收到 `BARRIER` 事件后在 Redis 写 `barrier:<runId>`（D5 的收敛信号）
   - `jmeter/users.csv` 每行 `userId,username`；`jmeter/tokens.csv` 每行 `userId,token`
 
-- [ ] **Step 1: `bin/seed-users.sh`**
+- [x] **Step 1: 账号池生成（实际写成 `bin/seed-users.py`，不是 `.sh`）**
 
-批量注册 10 万个账号并为每个账号登录拿 token，输出两个 CSV。这是压测有效性前提 ②——**压测中不走登录**，否则瓶颈在登录接口而不是报名链路。账号池用完后归档，不每次重新生成。
+批量注册 n 个账号并为每个账号登录拿 token，输出 `jmeter/tokens.csv`。这是压测有效性前提 ②——**压测中不走登录**，否则瓶颈在登录接口而不是报名链路。用法 `bin/seed-users.py 3000`；账号池用完后归档，不每次重新生成。
 
-- [ ] **Step 2: `jmeter/grab.jmx` —— 五条前提逐条落在配置里**
+- [x] **Step 2: `jmeter/grab.jmx` —— 五条前提逐条落在配置里**
 
 1. **CSV Data Set Config** 读 `jmeter/tokens.csv`，变量 `userId`/`token`，每线程取不同行 → 前提 ①
 2. **HTTP Header Manager** 带 `Authorization: Bearer ${token}` → 前提 ②
@@ -529,7 +523,7 @@ git add -A && git -c user.name=peekball -c user.email=peekball@local commit -m "
 
 **第 3、4 步看到的数据变化，比任何一次漂亮的压测报告都更能说明这些数字为什么可信。** 结论写进 `docs/benchmarks/README.md`。
 
-- [ ] **Step 5: `bin/verify.sh`**
+- [x] **Step 5: `bin/verify.sh`**（L0 无 MQ，所以**没有实现屏障**——屏障只对 L2 有必要，届时再加）
 
 两个子命令，压测前调一次、压测后调一次：
 
@@ -562,7 +556,7 @@ DBSTOCK=$(mysql -N -e "SELECT stock FROM activity WHERE id=$AID")
 人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh check 1 <capacity>`。
 Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被证明会失败**，否则它的通过没有意义。
 
-- [ ] **Step 7: 不写 `bin/bench.sh` —— 压测由作者在 JMeter GUI 里手动跑（作者要求）**
+- [x] **Step 7: 不写 `bin/bench.sh` —— 压测由作者在 JMeter GUI 里手动跑（作者要求）**
 
 `bench.sh` 原本做五件事：重置环境、起应用、灌活动、跑 JMeter、屏障+校验+归档。「起应用」已由 IDEA 负责，「跑 JMeter」由作者在 GUI 里点。剩下三件各自独立，不值得合成一个脚本：
 
@@ -603,7 +597,7 @@ jmeter -n -t jmeter/grab.jmx -Jthreads=3000 -Jduration=60 -Jcapacity=500 \
   -l run.jtl -e -o docs/benchmarks/html-report
 ```
 
-- [ ] **⛔ 停下来 + 第一次压测**
+- [x] **⛔ 停下来 + 第一次压测**（1000 线程 / 500 名额 / GUI，结果见 `docs/benchmarks/2026-11-23-L0-基线.md`）
 
 ```bash
 bin/verify.sh reset
@@ -613,11 +607,7 @@ bin/verify.sh check 1 500
 
 Expected: `VERIFY PASSED`，`docs/benchmarks/2026-11-21-L0-基线.md` 生成。**这是整个项目的第一个数字，也是后面每一级要对比的基准。**
 
-- [ ] **Step 8: 提交**
-
-```bash
-git add -A && git commit -m "feat: 压测脚手架（jmx + 预生成账号池 + verify 含屏障）"
-```
+- [x] **Step 8: 提交**（`c5ce5cd` 脚手架 + `eb6d71b` 基线记录）
 
 ---
 
