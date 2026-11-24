@@ -143,7 +143,19 @@ GUI 里 SimpleDataWriter 默认会带上 bizCode 列。
             <stringProp name="JSONPostProcessor.scope">all</stringProp>
           </JSONPostProcessor>
           <hashTree/>
-          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="响应体含 code:0（已禁用：这就是这个文件唯一的坏处）" enabled="false">
+<JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="把业务码追加到样本名（GUI 下按 code 分行看分布）" enabled="true">
+            <stringProp name="scriptLanguage">groovy</stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="script">def code = vars.get("bizCode")
+if (code != null) {
+    prev.setSampleLabel(prev.getSampleLabel() + " code=" + code)
+}</stringProp>
+            <boolProp name="cacheKey">true</boolProp>
+            <boolProp name="useCompiler">false</boolProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+                    <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="响应体含 code:0（已禁用：这就是这个文件唯一的坏处）" enabled="false">
             <collectionProp name="Asserion.test_strings">
               <stringProp name="49586">&quot;code&quot;:0</stringProp>
             </collectionProp>

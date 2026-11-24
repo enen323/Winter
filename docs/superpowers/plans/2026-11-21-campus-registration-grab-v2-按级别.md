@@ -525,11 +525,26 @@ Connector/J 默认 `false`，语义是「匹配到的行数」，于是 `INSERT 
 
 两个文件共同想说明的事：**吞吐量和错误率都不证明任何东西**，证明数据有效的是「成功数 == 名额数」和「失败码分布符合预期」同时成立。`grab-broken-same-user.jmx` 打破前者而后者毫无异常；`grab-broken-no-assertion.jmx` 两边都一片绿而 500 个请求其实一次都没报名成功。
 
+### GUI 下怎么看业务码分布（作者要求，2026-11-24 补）
+
+两个坏 jmx 都在 JSONPostProcessor 之后加了一个 `JSR223PostProcessor`，把 code 拼到样本名上：
+
+```groovy
+def code = vars.get("bizCode")
+if (code != null) {
+    prev.setSampleLabel(prev.getSampleLabel() + " code=" + code)
+}
+```
+
+于是 **Aggregate Report / Summary Report 直接按 code 分行**——`POST 报名 code=0` 500 行、`POST 报名 code=1001` 500 行，这就是错误码分布，零额外配置；`.jtl` 里 code 落在 `label` 列（表头本来就有），`awk -F, '{print $3}'` 与 `csv.DictReader` 都能正确解析。实测 `grab-broken-same-user.jmx` 的响应断言仍生效（Err 999 就是它报的）。
+
+**为什么不用 `sample_variables`**：那是 JMeter 属性，只能启动时给（`-Jsample_variables=bizCode` 或写 `jmeter.properties`）。`SampleEvent` 在类加载时就缓存了：`private static volatile String[] variableNames` + `static { ... initSampleVariables(); }`。实测在 setUp 线程组里 `props.put(...)` + `SampleEvent.initSampleVariables()`（该方法 `public static`，调得动）能把值写进行，但表头在 `testStarted()` 就写好了，结果是 17 列数据配 16 列表头的畸形 CSV。细节与实测数据见 `docs/benchmarks/2026-11-24-压测会怎么骗人.md`。
+
 - [x] **Step 4: 作者亲手跑一次（不可委派）**
 
 **作者已完成（2026-11-24）**：两个坏 jmx 都跑过，结果全部符合预期。实测数据与结论写在 `docs/benchmarks/2026-11-24-压测会怎么骗人.md`。
 
-关键数字（作者 GUI 跑 + AI 用 `-Jsample_variables=bizCode` 补跑）：
+关键数字（作者 GUI 跑 + AI 用 `-Jsample_variables=bizCode` 补跑；补跑后已改成把 code 拼进 label，GUI 下直接看分布）：
 
 | 实验 | 屏幕显示 | 实际 |
 | --- | --- | --- |
