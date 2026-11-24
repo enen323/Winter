@@ -2,6 +2,12 @@
 # 压测正确性校验。
 #
 #   bin/verify.sh reset                      清空报名与活动，准备下一轮
+#
+# reset 清两侧：MySQL 两张表 + Redis 里本项目的前缀 key。L1 起不清 Redis 会读到
+# 上一轮的 stock:1，新活动建好也会被 Lua 当成「名额已满」。
+#
+# 为什么用 SCAN + MATCH 而不是 FLUSHDB：这台 Redis 上还有作者其他项目的 key
+# （2026-11-24 实测 882 个，形如 $sales$DATA_DICT_*）。FLUSHDB 会把它们一起干掉。
 #   bin/verify.sh check <activityId> <capacity> [redis]
 #
 # reset 用 TRUNCATE 不用 DELETE：DELETE 不重置 AUTO_INCREMENT，第二轮活动会变成 id=2，
@@ -40,6 +46,18 @@ mysql_q() {
   MYSQL_PWD="$DB_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -N -B "$DB_NAME" -e "$1" 2>&1
 }
 
+# 只删本项目的前缀。绝不用 FLUSHDB（见文件头说明）。
+redis_reset_keys() {
+  local pattern key total=0
+  for pattern in 'stock:*' 'enrolled:*' 'result:*' 'activity:*' 'barrier:*'; do
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      redis-cli --raw DEL "$key" >/dev/null && total=$((total + 1))
+    done < <(redis-cli --scan --pattern "$pattern" 2>/dev/null)
+  done
+  echo "          Redis 已删 $total 个本项目 key（stock/enrolled/result/activity/barrier）"
+}
+
 # MySQL 8.4 起死锁计数搬到了这里，SHOW GLOBAL STATUS 里没有了。
 innodb_metric() {
   mysql_q "SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = '$1'"
@@ -56,6 +74,7 @@ cmd_reset() {
   deadlocks="$(innodb_metric lock_deadlocks)"
   lock_waits="$(mysql_q "SHOW GLOBAL STATUS LIKE 'Innodb_row_lock_waits'" | awk '{print $2}')"
   printf '%s %s\n' "$deadlocks" "$lock_waits" > "$BASELINE_FILE"
+  redis_reset_keys
   echo "reset 完成：registration 与 activity 已清空，id 从 1 重新开始"
   echo "          死锁基线 = $deadlocks，行锁等待基线 = $lock_waits（均自 MySQL 启动累计）"
 }
