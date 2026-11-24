@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Winter 抢名额压测（坏：不校验响应体）" enabled="true">
+      <stringProp name="TestPlan.comments">这个文件是「坏」的，用来证明压测数据可以一片全绿而完全没测到该测的东西。
+和 grab.jmx 的差别只有一处本质：「响应体含 code:0」这个断言被禁用了
+（右键它 → Enable 就能打开，打开后 Error % 会立刻跳回去）。
+
+跑的流程：
+  ① 跑 grab-broken-no-assertion.jmx（参数和 L0 基线完全一样：1000 线程 / 500 名额）
+  ② 对比 grab.jmx 的同参数结果
+  ③ bin/verify.sh check 1 500          ← 这个是通过的，问题不在服务端
+
+预期现象（这才是重点，不是错误）：
+  · Error % = 0.00%，一片绿。因为契约是所有响应都回 HTTP 200，
+    JMeter 看到 1000 个 200 OK，没有任何一个算失败。
+  · Throughput 也好看，和 grab.jmx 基本一致。
+  · 但 500 个请求其实拿到了 code 1001 名额已满——它们一次都没报名成功。
+  · 服务端完全正确：DB 里 registration 正好 500 行，stock = 0，
+    bin/verify.sh check 1 500 五条断言全过。
+
+想说明的事：HTTP 200 只代表「服务器收到了并回了」，不代表「事情办成了」。
+本项目的契约就是业务失败也回 200，所以 Error % 这一列在本项目恒等于 0，
+它不提供任何信息——你看到的绿色是设计使然，不是健康证明。
+真正有信息的是错误码分布（.jtl 的 bizCode 列）和服务端的对账结果。
+
+这就是为什么 grab.jmx 里必须有 Response Assertion 匹配 &quot;code&quot;:0：
+它把「HTTP 200」翻译成「报名成功」，Error % 才恢复本意。
+
+断言虽然禁用了，JSONPostProcessor 故意留着：打开 .jtl 能看到
+success=true 而 bizCode=1001——屏幕说成功，数据说没成。
+如果把这个也删了，你连错在哪都看不出来。
+
+GUI 里 SimpleDataWriter 默认会带上 bizCode 列。
+命令行跑要显式加 -Jsample_variables=bizCode，否则 .jtl 里没有这一列：
+  jmeter -n -t jmeter/grab-broken-no-assertion.jmx -Jthreads=1000 -JactivityId=1 -Jsample_variables=bizCode -l broken.jtl
+
+统计错误码分布：
+  awk -F, '{print $NF}' broken.jtl | sort | uniq -c | sort -rn
+  （bizCode 是最后一列；跑 grab.jmx 时同理，把文件名换成 run.jtl）</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="用户定义的变量" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="host" elementType="Argument">
+            <stringProp name="Argument.name">host</stringProp>
+            <stringProp name="Argument.value">${__P(host,localhost)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="port" elementType="Argument">
+            <stringProp name="Argument.name">port</stringProp>
+            <stringProp name="Argument.value">${__P(port,8081)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="activityId" elementType="Argument">
+            <stringProp name="Argument.name">activityId</stringProp>
+            <stringProp name="Argument.value">${__P(activityId,1)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="tokens" elementType="Argument">
+            <stringProp name="Argument.name">tokens</stringProp>
+            <stringProp name="Argument.value">${__P(tokens,jmeter/tokens.csv)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="jtl" elementType="Argument">
+            <stringProp name="Argument.name">jtl</stringProp>
+            <stringProp name="Argument.value">${__P(jtl,broken-no-assertion.jtl)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="抢名额线程组" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">1</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,1000)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">0</stringProp>
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+        <stringProp name="ThreadGroup.duration"></stringProp>
+        <stringProp name="ThreadGroup.delay"></stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="账号池 + 预签发 token" enabled="true">
+          <stringProp name="delimiter">,</stringProp>
+          <stringProp name="fileEncoding"></stringProp>
+          <stringProp name="filename">${__P(tokens,jmeter/tokens.csv)}</stringProp>
+          <boolProp name="ignoreFirstLine">true</boolProp>
+          <boolProp name="quotedData">false</boolProp>
+          <boolProp name="recycle">true</boolProp>
+          <boolProp name="stopThread">false</boolProp>
+          <stringProp name="shareMode">all</stringProp>
+          <stringProp name="variableNames">userId,token</stringProp>
+        </CSVDataSet>
+        <hashTree/>
+        <SyncTimer guiclass="TestBeanGUI" testclass="SyncTimer" testname="同步放行（到齐才发）" enabled="true">
+          <intProp name="groupSize">1000</intProp>
+          <longProp name="timeoutInMs">30000</longProp>
+        </SyncTimer>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST 报名" enabled="true">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量" enabled="true">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.domain">${__P(host,localhost)}</stringProp>
+          <stringProp name="HTTPSampler.port">${__P(port,8081)}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.contentEncoding"></stringProp>
+          <stringProp name="HTTPSampler.path">/api/registrations/${__P(activityId,1)}</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
+          <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
+          <stringProp name="HTTPSampler.connect_timeout"></stringProp>
+          <stringProp name="HTTPSampler.response_timeout"></stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP 信息头管理器" enabled="true">
+            <collectionProp name="HeaderManager.headers">
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Authorization</stringProp>
+                <stringProp name="Header.value">Bearer ${token}</stringProp>
+              </elementProp>
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Content-Type</stringProp>
+                <stringProp name="Header.value">application/json</stringProp>
+              </elementProp>
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>
+          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="提取响应体的 code" enabled="true">
+            <stringProp name="JSONPostProcessor.referenceNames">bizCode</stringProp>
+            <stringProp name="JSONPostProcessor.jsonPathExprs">$.code</stringProp>
+            <stringProp name="JSONPostProcessor.defaultValues">NONE</stringProp>
+            <stringProp name="JSONPostProcessor.scope">all</stringProp>
+          </JSONPostProcessor>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="响应体含 code:0（已禁用：这就是这个文件唯一的坏处）" enabled="false">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">&quot;code&quot;:0</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">契约：所有响应 HTTP 200，成败看 body 的 code。不匹配 code:0 记失败。</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">2</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="汇总报告（Error % 会是 0，别信）" enabled="true">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <timestamp>true</timestamp>
+              <success>true</success>
+              <label>true</label>
+              <code>true</code>
+              <message>true</message>
+              <threadName>true</threadName>
+              <dataType>true</dataType>
+              <encoding>false</encoding>
+              <assertions>true</assertions>
+              <subresults>true</subresults>
+              <responseData>false</responseData>
+              <samplerData>false</samplerData>
+              <xml>false</xml>
+              <fieldNames>true</fieldNames>
+              <responseHeaders>false</responseHeaders>
+              <requestHeaders>false</requestHeaders>
+              <responseDataOnError>false</responseDataOnError>
+              <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+              <assertionsResultsToSave>0</assertionsResultsToSave>
+              <bytes>true</bytes>
+              <sentBytes>true</sentBytes>
+              <url>true</url>
+              <threadCounts>true</threadCounts>
+              <idleTime>true</idleTime>
+              <connectTime>true</connectTime>
+            </value>
+          </objProp>
+          <stringProp name="filename"></stringProp>
+        </ResultCollector>
+        <hashTree/>
+        <ResultCollector guiclass="SimpleDataWriter" testclass="ResultCollector" testname="Simple Data Writer（存原始数据）" enabled="true">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <timestamp>true</timestamp>
+              <success>true</success>
+              <label>true</label>
+              <code>true</code>
+              <message>true</message>
+              <threadName>true</threadName>
+              <dataType>true</dataType>
+              <encoding>false</encoding>
+              <assertions>true</assertions>
+              <subresults>true</subresults>
+              <responseData>false</responseData>
+              <samplerData>false</samplerData>
+              <xml>false</xml>
+              <fieldNames>true</fieldNames>
+              <responseHeaders>false</responseHeaders>
+              <requestHeaders>false</requestHeaders>
+              <responseDataOnError>false</responseDataOnError>
+              <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+              <assertionsResultsToSave>0</assertionsResultsToSave>
+              <bytes>true</bytes>
+              <sentBytes>true</sentBytes>
+              <url>true</url>
+              <threadCounts>true</threadCounts>
+              <idleTime>true</idleTime>
+              <connectTime>true</connectTime>
+            </value>
+          </objProp>
+          <stringProp name="filename">${__P(jtl,broken-no-assertion.jtl)}</stringProp>
+        </ResultCollector>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

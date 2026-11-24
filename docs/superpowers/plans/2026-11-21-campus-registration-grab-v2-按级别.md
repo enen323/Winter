@@ -510,18 +510,35 @@ Connector/J 默认 `false`，语义是「匹配到的行数」，于是 `INSERT 
 5. **Response Assertion** 对响应体匹配 `"code":0`，配 **JSON Extractor** 把 `code` 提成变量 → 前提 ③
 6. **监听器**：Summary Report + Aggregate Graph + `Simple Data Writer` 写 `.jtl`
 
-- [ ] **Step 3: 两个「坏」jmx（必须入库）**
+- [x] **Step 3: 两个「坏」jmx（必须入库）**
 
-`grab-broken-same-user.jmx`：CSV 改成常量 userId。`grab-broken-no-assertion.jmx`：去掉响应断言，按 HTTP 200 判成功。这两个文件证明「什么样的压测数据是假的」。
+`grab-broken-no-assertion.jmx`：与 `grab.jmx` 只差一处——「响应体含 code:0」断言被**禁用**（右键 → Enable 就能打开，Error % 立刻跳回去）。JSONPostProcessor 故意留着，打开 `.jtl` 能看到 `success=true` 而 `bizCode=1001`——屏幕说成功，数据说没成。删了它你就连错在哪都看不出来。
+
+`grab-broken-same-user.jmx`：**不是**原计划写的「CSV 改成常量 userId」——那样改没有用，因为报名接口从 JWT token 解 userId，根本不看 CSV 的 userId 列。实际做法是让所有线程共用一个身份：
+
+- `setUp 线程组`注册固定账号 `broken_same_user`（已存在返回 1500，忽略即可）
+- 主线程组每个线程先 `POST /api/auth/login` 这个账号，用响应的 token 报名
+- CSVDataSet 与 SyncTimer **禁用不删**（方便对照 `grab.jmx`）：CSV 不再需要；只有一个身份，没有并发可造，同步定时器反而会让线程数小于 1000 时白等 30 秒
+- 账号留在 `app_user` 表，`verify.sh reset` 不清它，重跑不会失败
+
+**为什么用登录而不是硬编码一个 token**：token TTL 30 分钟，写死进会提交的文件，半小时后交付物就过期了。也不改成「CSV 每行同一个 token」——那要每次重新生成。登录是唯一不会腐烂的写法。
+
+两个文件共同想说明的事：**吞吐量和错误率都不证明任何东西**，证明数据有效的是「成功数 == 名额数」和「失败码分布符合预期」同时成立。`grab-broken-same-user.jmx` 打破前者而后者毫无异常；`grab-broken-no-assertion.jmx` 两边都一片绿而 500 个请求其实一次都没报名成功。
 
 - [ ] **Step 4: 作者亲手跑一次（不可委派）**
 
-1. GUI 模式打开 `jmeter/grab.jmx`，线程数 50、时长 30 秒，**手动跑一次**，逐个点开 Summary Report / Aggregate Graph / View Results Tree 看每项含义
+1. GUI 模式打开 `jmeter/grab.jmx`，**线程数填 1000**（必须 ≥ SyncTimer 的 `groupSize`，见下），点 Run 手动跑一次，逐个点开 Summary Report / View Results Tree 看每项含义
 2. 打开生成的 `.jtl`，逐列看懂 `timeStamp`/`elapsed`/`label`/`responseCode`/`responseMessage`/`success`/`bytes`/`sentBytes`/`grpThreads`/`allThreads`/`Latency`/`IdleTime`/`Connect`
 3. 跑 `grab-broken-same-user.jmx` 对比：成功数应接近 1、绝大多数返回 `"code":1002`——这就是「测的是去重而非抢名额」
-4. 跑 `grab-broken-no-assertion.jmx` 对比：HTTP 200 但 body 是 `"code":1001` 的样本被算成成功
+4. 跑 `grab-broken-no-assertion.jmx` 对比：HTTP 200 但 body 是 `"code":1001` 的样本被算成成功，Error % 一片绿
 
 **第 3、4 步看到的数据变化，比任何一次漂亮的压测报告都更能说明这些数字为什么可信。** 结论写进 `docs/benchmarks/README.md`。
+
+### 手工课必须先知道的两件事
+
+**① 线程数不能小于 `groupSize`。** `grab.jmx` 里 SyncTimer 的 `groupSize` 写死 1000——它是 `intProp`，编译期就是 int，写 `${__P(threads,1000)}` 会直接 `NumberFormatException: For input string: "${__P(threads,1000)}"}`（已实测），所以只能用字面量。线程数小于 1000 时同步定时器等不齐，白等 30 秒超时才放行。想用 50 线程练手，就把 SyncTimer 的 `groupSize` 临时也改成 50。
+
+**② 这是一次纯爆发，不是持续 30 秒。** 线程组 `Loop Count = 1`、没开 Scheduler，所以每个线程只发一个请求，两秒左右就跑完——这正好是「到点瞬间」的样子。想观察吞吐量随时间的变化，得把 Loop Count 改成 Infinite 并开 Scheduler 设 Duration，但那样第二轮起同一批 token 会全部返回 `1002 已报名过`，测不到 `1001 名额已满`。
 
 - [x] **Step 5: `bin/verify.sh`**（L0 无 MQ，所以**没有实现屏障**——屏障只对 L2 有必要，届时再加）
 
