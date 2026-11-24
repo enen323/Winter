@@ -653,7 +653,7 @@ jmeter -n -t jmeter/grab.jmx -Jthreads=3000 -Jduration=60 -Jcapacity=500 \
   -l run.jtl -e -o docs/benchmarks/html-report
 ```
 
-- [x] **⛔ 停下来 + 第一次压测**（1000 线程 / 500 名额 / GUI，结果见 `docs/benchmarks/2026-11-23-L0-基线.md`）
+- [x] **⛔ 停下来 + 第一次压测**（1000 线程 / 500 名额 / GUI，试跑轮；该文件已于 2026-11-24 删除，作者要求 `docs/benchmarks/` 只留正式基线，原文见 `git show eb6d71b:docs/benchmarks/2026-11-23-L0-基线.md`。正式基线见 `docs/benchmarks/2026-11-24-L0-正式基线-3000线程.md`）
 
 ```bash
 bin/verify.sh reset
