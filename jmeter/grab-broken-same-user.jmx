@@ -79,7 +79,7 @@
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST 注册坏账号" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量" enabled="true">
             <collectionProp name="Arguments.arguments">
-              <elementProp name="" elementType="Argument">
+              <elementProp name="" elementType="HTTPArgument">
                 <stringProp name="Argument.name"></stringProp>
                 <stringProp name="Argument.value">{&quot;username&quot;:&quot;broken_same_user&quot;,&quot;password&quot;:&quot;bench-pass-123&quot;}</stringProp>
                 <stringProp name="Argument.metadata">=</stringProp>
@@ -147,7 +147,7 @@
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST 登录（拿同一个账号的 token）" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量" enabled="true">
             <collectionProp name="Arguments.arguments">
-              <elementProp name="" elementType="Argument">
+              <elementProp name="" elementType="HTTPArgument">
                 <stringProp name="Argument.name"></stringProp>
                 <stringProp name="Argument.value">{&quot;username&quot;:&quot;broken_same_user&quot;,&quot;password&quot;:&quot;bench-pass-123&quot;}</stringProp>
                 <stringProp name="Argument.metadata">=</stringProp>
