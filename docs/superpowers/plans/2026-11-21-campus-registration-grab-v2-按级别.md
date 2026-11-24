@@ -525,7 +525,20 @@ Connector/J 默认 `false`，语义是「匹配到的行数」，于是 `INSERT 
 
 两个文件共同想说明的事：**吞吐量和错误率都不证明任何东西**，证明数据有效的是「成功数 == 名额数」和「失败码分布符合预期」同时成立。`grab-broken-same-user.jmx` 打破前者而后者毫无异常；`grab-broken-no-assertion.jmx` 两边都一片绿而 500 个请求其实一次都没报名成功。
 
-- [ ] **Step 4: 作者亲手跑一次（不可委派）**
+- [x] **Step 4: 作者亲手跑一次（不可委派）**
+
+**作者已完成（2026-11-24）**：两个坏 jmx 都跑过，结果全部符合预期。实测数据与结论写在 `docs/benchmarks/2026-11-24-压测会怎么骗人.md`。
+
+关键数字（作者 GUI 跑 + AI 用 `-Jsample_variables=bizCode` 补跑）：
+
+| 实验 | 屏幕显示 | 实际 |
+| --- | --- | --- |
+| `grab-broken-same-user.jmx`（100 线程） | 报名成功 1、被拒 99 | 在测去重不在测抢名额 |
+| 同上（1000 线程，补跑） | 成功率 0.1% | `code=0` × 1、`code=1002` × 999 |
+| `grab-broken-no-assertion.jmx`（1000 线程） | **Err 0.00%、success=true 1000/1000** | `code=0` × 500、`code=1001` × 500 |
+| 补跑时 token 恰好过期 | **Err 0.00%、1848/s** | 1000 个全 `code=1400`，一个都没进报名逻辑 |
+
+**补跑时撞见的坑（已写进该文件）**：`jmeter/tokens.csv` 是 10:07 生成的，`winter.jwt.ttl = PT30M`，10:37 起全部失效。**每轮压测前必须重新 `bin/seed-users.py <count>`**，否则去掉断言后连「用户根本没登录」都看不出来。
 
 1. GUI 模式打开 `jmeter/grab.jmx`，**线程数填 1000**（必须 ≥ SyncTimer 的 `groupSize`，见下），点 Run 手动跑一次，逐个点开 Summary Report / View Results Tree 看每项含义
 2. 打开生成的 `.jtl`，逐列看懂 `timeStamp`/`elapsed`/`label`/`responseCode`/`responseMessage`/`success`/`bytes`/`sentBytes`/`grpThreads`/`allThreads`/`Latency`/`IdleTime`/`Connect`
@@ -568,10 +581,21 @@ DBSTOCK=$(mysql -N -e "SELECT stock FROM activity WHERE id=$AID")
 
 任一条不满足打印 `VERIFY FAILED: <原因>` 并 `exit 1`；全过打印 `VERIFY PASSED`。
 
-- [ ] **Step 6: 证明 verify.sh 会失败**
+- [x] **Step 6: 证明 verify.sh 会失败**（2026-11-24，由作者手工触发）
 
-人为注入一次超卖（把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录），运行 `bin/verify.sh check 1 <capacity>`。
-Expected: 退出码非 0，输出 `VERIFY FAILED`。**校验脚本必须能被证明会失败**，否则它的通过没有意义。
+作者把 `registration` 里 `id=1` 那行的 `status` 从 `CONFIRMED` 改成 `501`，然后跑 `bin/verify.sh check 1 500`：
+
+```text
+VERIFY FAILED: DB 报名成功数 = 499，期望 500（名额被吞或超卖）
+```
+
+退出码非 0，断言 ① 当场抓住。**校验脚本必须能被证明会失败，否则它的通过没有意义——现在它有真实的失败记录了。** 全过程与顺带查清的两件事（`lock_deadlocks` 是 `enabled` 不是 `disabled`；这台 Redis 上还有作者其他项目的 882 个 key 所以 `reset` 绝不能 `FLUSHDB`）记录在 `docs/benchmarks/2026-11-24-数据异常-501.md`。
+
+原计划写的是「把 `$CAPACITY` 改小，或直接往 DB 插一条超出名额的记录」——作者选了第三种更狠的：改已有行的 `status`。这比插新行更能证明断言 ① 在看的是**内容**而不是行数。
+
+### 阶段 P 到此完成
+
+Step 1–8 全部 `[x]`（Step 4 手工课作者已跑完两个坏 jmx）。下一阶段：**L1 Redis Lua 预扣 + 同步落库**。
 
 - [x] **Step 7: 不写 `bin/bench.sh` —— 压测由作者在 JMeter GUI 里手动跑（作者要求）**
 
